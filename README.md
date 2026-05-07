@@ -28,7 +28,7 @@ graph TB
 
         subgraph gw ["Gateway (Envoy)"]
             envoy["Envoy"]
-            oauth2proxy["oauth2-proxy"]
+            kubeauth["kube-auth-proxy"]
             kuberbac["kube-rbac-proxy"]
         end
 
@@ -44,13 +44,13 @@ graph TB
         gwctrl -->|"watch HTTPRoutes"| apiserver
         projectctrl -->|"mirror Namespaces<br/>→ Projects"| apiserver
         serviceca -->|"inject TLS certs"| apiserver
-        oauthctrl -->|"issue JWTs"| oauth2proxy
+        oauthctrl -->|"issue JWTs"| kubeauth
 
         odhop -->|"reconcile CRs"| ocpshim
         dashboard --> kuberbac
         kuberbac --> dashboard
 
-        envoy --> oauth2proxy
+        envoy -->|"ext_authz"| kubeauth
         envoy --> kuberbac
     end
 
