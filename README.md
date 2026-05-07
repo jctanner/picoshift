@@ -6,6 +6,59 @@ It provides just enough of the OCP control plane for operators like
 and the ODH Dashboard to start, reconcile, and serve a working UI — all on a
 single laptop with ~200 MB of RAM.
 
+```mermaid
+graph TB
+    browser["Browser"]
+
+    subgraph kind ["kind cluster (single node)"]
+        subgraph shim ["ocp-shim"]
+            apiserver["kube-apiserver"]
+            ocpshim["ocp-shim proxy<br/><i>OCP discovery endpoints</i>"]
+            ocpshim --> apiserver
+        end
+
+        subgraph sim ["ocp-sim (DaemonSet)"]
+            proxy["Reverse Proxy<br/><i>*.apps.ocp-sim.localhost</i>"]
+            routectrl["Route Controller"]
+            gwctrl["Gateway Controller<br/><i>Envoy xDS generation</i>"]
+            oauthctrl["OAuth Server"]
+            projectctrl["Project Controller"]
+            serviceca["Service CA"]
+        end
+
+        subgraph gw ["Gateway (Envoy)"]
+            envoy["Envoy"]
+            oauth2proxy["oauth2-proxy"]
+            kuberbac["kube-rbac-proxy"]
+        end
+
+        subgraph workloads ["Operator Workloads"]
+            odhop["opendatahub-operator"]
+            dashboard["ODH Dashboard"]
+        end
+
+        crds[("OpenShift CRDs<br/>+ seed resources")]
+
+        routectrl -->|"watch Routes<br/>stamp .status"| apiserver
+        gwctrl -->|"write xDS config"| envoy
+        gwctrl -->|"watch HTTPRoutes"| apiserver
+        projectctrl -->|"mirror Namespaces<br/>→ Projects"| apiserver
+        serviceca -->|"inject TLS certs"| apiserver
+        oauthctrl -->|"issue JWTs"| oauth2proxy
+
+        odhop -->|"reconcile CRs"| ocpshim
+        dashboard --> kuberbac
+        kuberbac --> dashboard
+
+        envoy --> oauth2proxy
+        envoy --> kuberbac
+    end
+
+    browser -->|":443"| proxy
+    proxy --> envoy
+    browser -->|"OAuth login"| oauthctrl
+```
+
 ## Why
 
 Real OpenShift clusters are heavy, slow to provision, and expensive to keep
