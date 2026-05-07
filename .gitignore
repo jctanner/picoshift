@@ -1,0 +1,23 @@
+# Cloned source repos
+example.src/
+
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# Node
+node_modules/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

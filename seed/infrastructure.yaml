@@ -1,0 +1,12 @@
+apiVersion: config.openshift.io/v1
+kind: Infrastructure
+metadata:
+  name: cluster
+spec:
+  platformSpec:
+    type: None
+status:
+  controlPlaneTopology: SingleReplica
+  infrastructureTopology: SingleReplica
+  platform: None
+  apiServerURL: https://127.0.0.1:6443

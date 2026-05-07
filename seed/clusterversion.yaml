@@ -1,0 +1,30 @@
+apiVersion: config.openshift.io/v1
+kind: ClusterVersion
+metadata:
+  name: version
+spec:
+  clusterID: ocp-sim-00000000-0000-0000-0000-000000000000
+  channel: stable-4.20
+status:
+  desired:
+    version: "4.20.0"
+  history:
+    - state: Completed
+      version: "4.20.0"
+      startedTime: "2024-01-01T00:00:00Z"
+      completionTime: "2024-01-01T01:00:00Z"
+      verified: true
+  conditions:
+    - type: Available
+      status: "True"
+      lastTransitionTime: "2024-01-01T01:00:00Z"
+      reason: ClusterVersionAvailable
+      message: "Simulated OCP cluster"
+    - type: Progressing
+      status: "False"
+      lastTransitionTime: "2024-01-01T01:00:00Z"
+      reason: ClusterVersionNotProgressing
+    - type: Failing
+      status: "False"
+      lastTransitionTime: "2024-01-01T01:00:00Z"
+      reason: ClusterVersionNotFailing

@@ -1,0 +1,176 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clusterserviceversions.operators.coreos.com
+spec:
+  group: operators.coreos.com
+  names:
+    kind: ClusterServiceVersion
+    listKind: ClusterServiceVersionList
+    plural: clusterserviceversions
+    singular: clusterserviceversion
+    shortNames: [csv, csvs]
+    categories: [olm]
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: subscriptions.operators.coreos.com
+spec:
+  group: operators.coreos.com
+  names:
+    kind: Subscription
+    listKind: SubscriptionList
+    plural: subscriptions
+    singular: subscription
+    shortNames: [sub, subs]
+    categories: [olm]
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: catalogsources.operators.coreos.com
+spec:
+  group: operators.coreos.com
+  names:
+    kind: CatalogSource
+    listKind: CatalogSourceList
+    plural: catalogsources
+    singular: catalogsource
+    shortNames: [catsrc]
+    categories: [olm]
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: installplans.operators.coreos.com
+spec:
+  group: operators.coreos.com
+  names:
+    kind: InstallPlan
+    listKind: InstallPlanList
+    plural: installplans
+    singular: installplan
+    shortNames: [ip]
+    categories: [olm]
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: operatorconditions.operators.coreos.com
+spec:
+  group: operators.coreos.com
+  names:
+    kind: OperatorCondition
+    listKind: OperatorConditionList
+    plural: operatorconditions
+    singular: operatorcondition
+    categories: [olm]
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: false
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+    - name: v2
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: operatorgroups.operators.coreos.com
+spec:
+  group: operators.coreos.com
+  names:
+    kind: OperatorGroup
+    listKind: OperatorGroupList
+    plural: operatorgroups
+    singular: operatorgroup
+    shortNames: [og]
+    categories: [olm]
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: operators.operators.coreos.com
+spec:
+  group: operators.coreos.com
+  names:
+    kind: Operator
+    listKind: OperatorList
+    plural: operators
+    singular: operator
+  scope: Cluster
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
