@@ -297,6 +297,8 @@ fn generate_rds_yaml(hostname: &str, routes: &[HttpRouteRule]) -> String {
                 prefix: "{}"
               route:
                 cluster: {}
+                upgrade_configs:
+                - upgrade_type: websocket
 "#,
                 rule.path_prefix, cluster_name
             ));

@@ -14,7 +14,8 @@ SUDO           ?= sudo
 # ──────────────────────────────────────────────
 
 .PHONY: all build-all cluster deploy setup teardown status logs \
-       operator-install operator-run operator-crds dsci dsc rebuild
+       operator-install operator-run operator-crds dsci dsc rebuild \
+       workbench patch-gatewayconfig-tls
 
 all: build-all cluster deploy
 	@echo ""
@@ -240,7 +241,7 @@ operator-load:
 		ctr --namespace=k8s.io images import --no-unpack - < /tmp/odh-operator-oci.tar
 	$(SUDO) rm -f /tmp/odh-operator-oci.tar
 
-operator-deploy: operator-crds
+operator-deploy: operator-image operator-load operator-crds
 	$(MAKE) -C $(ODH_DIR) prepare IMG=$(ODH_OPERATOR_IMAGE)
 	$(ODH_KUSTOMIZE) build $(ODH_DIR)/config/default \
 		| sed 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
@@ -257,13 +258,32 @@ operator-redeploy:
 operator-logs:
 	kubectl -n $(OPERATOR_NAMESPACE) logs -l control-plane=controller-manager -c manager -f
 
-operator-install: operator-image operator-load operator-deploy dsci dsc
+operator-install: operator-deploy dsci dsc
 
 dsci:
 	kubectl apply -f $(ODH_DIR)/config/samples/dscinitialization_v2_dscinitialization.yaml
 
 dsc:
 	kubectl apply -f $(ODH_DIR)/config/samples/datasciencecluster_v2_datasciencecluster.yaml
+
+# ──────────────────────────────────────────────
+# Workbench
+# ──────────────────────────────────────────────
+
+WORKBENCH_PROJECT   ?= project1
+WORKBENCH_NAME      ?= workbench1
+WORKBENCH_IMAGE     ?= jupyter-minimal-notebook:3.4
+
+.PHONY: workbench
+
+workbench:
+	python3 scripts/create-workbench.py \
+		--project $(WORKBENCH_PROJECT) \
+		--workbench $(WORKBENCH_NAME) \
+		--image $(WORKBENCH_IMAGE)
+
+patch-gatewayconfig-tls:
+	python3 scripts/patch-gatewayconfig-tls.py
 
 # ──────────────────────────────────────────────
 # Cleanup
