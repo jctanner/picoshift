@@ -1,7 +1,11 @@
 use std::sync::Arc;
 use std::collections::BTreeMap;
 
+use base64::Engine;
 use futures::StreamExt;
+use k8s_openapi::api::admissionregistration::v1::{
+    MutatingWebhookConfiguration, ValidatingWebhookConfiguration,
+};
 use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::ByteString;
@@ -25,6 +29,10 @@ fn generate_serving_cert(
     let ca_key = KeyPair::from_pem(&ca.ca_key_pem)?;
     let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        rcgen::DnValue::Utf8String("ocp-sim-service-ca".into()),
+    );
     let issuer = Issuer::from_params(&ca_params, &ca_key);
 
     let mut params = CertificateParams::new(vec![cn.to_string()])?;
@@ -54,9 +62,19 @@ async fn reconcile_service(
     let ns = svc.namespace().unwrap_or_default();
     let svc_name = svc.name_any();
 
+    let ca_fingerprint = ca_bundle_base64(ca);
     let secrets: Api<Secret> = Api::namespaced(client.clone(), &ns);
-    if secrets.get_opt(&secret_name).await?.is_some() {
-        return Ok(Action::await_change());
+    if let Some(existing) = secrets.get_opt(&secret_name).await? {
+        let existing_fp = existing
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("ocp-sim/ca-fingerprint"));
+        if existing_fp == Some(&ca_fingerprint) {
+            return Ok(Action::await_change());
+        }
+        secrets.delete(&secret_name, &Default::default()).await?;
+        info!(ns, svc_name, secret_name, "deleted stale TLS secret (CA changed)");
     }
 
     let cn = format!("{svc_name}.{ns}.svc");
@@ -72,6 +90,9 @@ async fn reconcile_service(
         metadata: ObjectMeta {
             name: Some(secret_name.clone()),
             namespace: Some(ns.clone()),
+            annotations: Some(BTreeMap::from([
+                ("ocp-sim/ca-fingerprint".to_string(), ca_fingerprint),
+            ])),
             owner_references: Some(vec![OwnerReference {
                 api_version: "v1".to_string(),
                 kind: "Service".to_string(),
@@ -200,4 +221,179 @@ fn error_policy_cm(
     _ctx: Arc<(Client, Arc<CaState>)>,
 ) -> Action {
     Action::requeue(std::time::Duration::from_secs(10))
+}
+
+// --- Webhook CA bundle injection ---
+
+fn ca_bundle_base64(ca: &CaState) -> String {
+    base64::engine::general_purpose::STANDARD.encode(ca.ca_cert_pem.as_bytes())
+}
+
+fn needs_cabundle_injection(annotations: Option<&BTreeMap<String, String>>) -> bool {
+    annotations
+        .and_then(|a| a.get(INJECT_CABUNDLE_ANNOTATION))
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+async fn reconcile_mutating_webhook(
+    mwc: Arc<MutatingWebhookConfiguration>,
+    ctx: Arc<(Client, Arc<CaState>)>,
+) -> Result<Action, kube::Error> {
+    let (client, ca) = ctx.as_ref();
+
+    if !needs_cabundle_injection(mwc.metadata.annotations.as_ref()) {
+        return Ok(Action::await_change());
+    }
+
+    let expected_ca = ca.ca_cert_pem.as_bytes();
+    let name = mwc.name_any();
+
+    let existing_bundle = mwc
+        .webhooks
+        .as_ref()
+        .and_then(|whs| whs.first())
+        .and_then(|wh| wh.client_config.ca_bundle.as_ref());
+
+    if let Some(b) = existing_bundle {
+        if b.0 == expected_ca {
+            return Ok(Action::await_change());
+        }
+    }
+
+    let ca_b64 = ca_bundle_base64(ca);
+
+    let json_patch: Vec<serde_json::Value> = mwc
+        .webhooks
+        .as_ref()
+        .map(|whs| {
+            whs.iter()
+                .enumerate()
+                .map(|(i, _wh)| {
+                    serde_json::json!({
+                        "op": "add",
+                        "path": format!("/webhooks/{i}/clientConfig/caBundle"),
+                        "value": ca_b64
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let api: Api<MutatingWebhookConfiguration> = Api::all(client.clone());
+    api.patch(&name, &PatchParams::default(), &Patch::Json::<()>(serde_json::from_value(serde_json::Value::Array(json_patch)).unwrap()))
+        .await?;
+
+    info!(name, "injected caBundle into MutatingWebhookConfiguration");
+    Ok(Action::await_change())
+}
+
+fn error_policy_mwc(
+    _obj: Arc<MutatingWebhookConfiguration>,
+    _error: &kube::Error,
+    _ctx: Arc<(Client, Arc<CaState>)>,
+) -> Action {
+    Action::requeue(std::time::Duration::from_secs(10))
+}
+
+pub async fn run_mutating_webhook_controller(
+    client: Client,
+    ca: Arc<CaState>,
+) -> Result<(), kube::Error> {
+    let api: Api<MutatingWebhookConfiguration> = Api::all(client.clone());
+    let ctx = Arc::new((client, ca));
+
+    info!("starting mutating-webhook ca-inject controller");
+
+    Controller::new(api, watcher::Config::default())
+        .run(reconcile_mutating_webhook, error_policy_mwc, ctx)
+        .for_each(|res| async move {
+            if let Err(e) = res {
+                warn!("mutating webhook reconcile error: {e:?}");
+            }
+        })
+        .await;
+
+    Ok(())
+}
+
+async fn reconcile_validating_webhook(
+    vwc: Arc<ValidatingWebhookConfiguration>,
+    ctx: Arc<(Client, Arc<CaState>)>,
+) -> Result<Action, kube::Error> {
+    let (client, ca) = ctx.as_ref();
+
+    if !needs_cabundle_injection(vwc.metadata.annotations.as_ref()) {
+        return Ok(Action::await_change());
+    }
+
+    let expected_ca = ca.ca_cert_pem.as_bytes();
+    let name = vwc.name_any();
+
+    let existing_bundle = vwc
+        .webhooks
+        .as_ref()
+        .and_then(|whs| whs.first())
+        .and_then(|wh| wh.client_config.ca_bundle.as_ref());
+
+    if let Some(b) = existing_bundle {
+        if b.0 == expected_ca {
+            return Ok(Action::await_change());
+        }
+    }
+
+    let ca_b64 = ca_bundle_base64(ca);
+
+    let json_patch: Vec<serde_json::Value> = vwc
+        .webhooks
+        .as_ref()
+        .map(|whs| {
+            whs.iter()
+                .enumerate()
+                .map(|(i, _wh)| {
+                    serde_json::json!({
+                        "op": "add",
+                        "path": format!("/webhooks/{i}/clientConfig/caBundle"),
+                        "value": ca_b64
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let api: Api<ValidatingWebhookConfiguration> = Api::all(client.clone());
+    api.patch(&name, &PatchParams::default(), &Patch::Json::<()>(serde_json::from_value(serde_json::Value::Array(json_patch)).unwrap()))
+        .await?;
+
+    info!(name, "injected caBundle into ValidatingWebhookConfiguration");
+    Ok(Action::await_change())
+}
+
+fn error_policy_vwc(
+    _obj: Arc<ValidatingWebhookConfiguration>,
+    _error: &kube::Error,
+    _ctx: Arc<(Client, Arc<CaState>)>,
+) -> Action {
+    Action::requeue(std::time::Duration::from_secs(10))
+}
+
+pub async fn run_validating_webhook_controller(
+    client: Client,
+    ca: Arc<CaState>,
+) -> Result<(), kube::Error> {
+    let api: Api<ValidatingWebhookConfiguration> = Api::all(client.clone());
+    let ctx = Arc::new((client, ca));
+
+    info!("starting validating-webhook ca-inject controller");
+
+    Controller::new(api, watcher::Config::default())
+        .run(reconcile_validating_webhook, error_policy_vwc, ctx)
+        .for_each(|res| async move {
+            if let Err(e) = res {
+                warn!("validating webhook reconcile error: {e:?}");
+            }
+        })
+        .await;
+
+    Ok(())
 }

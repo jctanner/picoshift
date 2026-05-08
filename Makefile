@@ -206,7 +206,14 @@ verify:
 # ODH Operator
 # ──────────────────────────────────────────────
 
-ODH_DIR := example.src/opendatahub-operator
+ODH_DIR            := example.src/opendatahub-operator
+ODH_OPERATOR_IMAGE := localhost/odh-operator:latest
+ODH_KUSTOMIZE      := $(ODH_DIR)/bin/kustomize
+OPERATOR_NAMESPACE := opendatahub-operator-system
+
+.PHONY: operator-crds operator-run operator-image operator-load \
+        operator-deploy operator-redeploy operator-logs \
+        dsci dsc operator-install
 
 operator-crds:
 	$(MAKE) -C $(ODH_DIR) manifests
@@ -215,13 +222,46 @@ operator-crds:
 operator-run:
 	ODH_MANAGER_METRICS_BIND_ADDRESS=:9090 $(MAKE) -C $(ODH_DIR) run-nowebhook
 
+operator-image:
+	$(MAKE) -C $(ODH_DIR) manifests
+	$(SUDO) podman build --no-cache \
+		-f $(ODH_DIR)/Dockerfiles/Dockerfile \
+		--build-arg USE_LOCAL=false \
+		--build-arg CGO_ENABLED=1 \
+		--platform linux/amd64 \
+		-t $(ODH_OPERATOR_IMAGE) \
+		$(ODH_DIR)
+
+operator-load:
+	$(SUDO) podman save $(ODH_OPERATOR_IMAGE) --format oci-archive -o /tmp/odh-operator-oci.tar
+	$(SUDO) podman exec -i $(CLUSTER_NAME)-control-plane \
+		ctr --namespace=k8s.io images import --no-unpack - < /tmp/odh-operator-oci.tar
+	$(SUDO) rm -f /tmp/odh-operator-oci.tar
+
+operator-deploy: operator-crds
+	$(MAKE) -C $(ODH_DIR) prepare IMG=$(ODH_OPERATOR_IMAGE)
+	$(ODH_KUSTOMIZE) build $(ODH_DIR)/config/default \
+		| sed 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
+		| sed 's/replicas: 3/replicas: 1/g' \
+		| kubectl apply -f -
+	kubectl -n $(OPERATOR_NAMESPACE) rollout status deployment/opendatahub-operator-controller-manager --timeout=120s
+
+operator-redeploy:
+	$(MAKE) operator-image
+	$(MAKE) operator-load
+	kubectl -n $(OPERATOR_NAMESPACE) rollout restart deployment/opendatahub-operator-controller-manager
+	kubectl -n $(OPERATOR_NAMESPACE) rollout status deployment/opendatahub-operator-controller-manager --timeout=120s
+
+operator-logs:
+	kubectl -n $(OPERATOR_NAMESPACE) logs -l control-plane=controller-manager -c manager -f
+
+operator-install: operator-image operator-load operator-deploy dsci dsc
+
 dsci:
 	kubectl apply -f $(ODH_DIR)/config/samples/dscinitialization_v2_dscinitialization.yaml
 
 dsc:
 	kubectl apply -f $(ODH_DIR)/config/samples/datasciencecluster_v2_datasciencecluster.yaml
-
-operator-install: operator-crds dsci dsc
 
 # ──────────────────────────────────────────────
 # Cleanup
