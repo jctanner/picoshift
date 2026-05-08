@@ -9,6 +9,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use k8s_openapi::api::core::v1::{Endpoints, Service};
 use kube::api::{Api, ApiResource, DynamicObject};
 use kube::runtime::watcher;
@@ -239,6 +240,146 @@ async fn resolve_endpoint(
     None
 }
 
+async fn ws_handshake_and_tunnel<S>(
+    req: Request<Incoming>,
+    host: &str,
+    path: &str,
+    tls_incoming: bool,
+    mut upstream: S,
+) -> Result<Response<Full<Bytes>>, hyper::Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut raw_req = format!(
+        "{} {} HTTP/1.1\r\nHost: {host}\r\n",
+        req.method(),
+        path,
+    );
+    for (key, value) in req.headers() {
+        if key != "host" {
+            if let Ok(v) = value.to_str() {
+                raw_req.push_str(&format!("{}: {v}\r\n", key));
+            }
+        }
+    }
+    if tls_incoming {
+        raw_req.push_str("X-Forwarded-Proto: https\r\n");
+    }
+    raw_req.push_str("\r\n");
+
+    if let Err(e) = upstream.write_all(raw_req.as_bytes()).await {
+        warn!("upstream write failed: {e}");
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Full::new(Bytes::from("upstream write failed\n")))
+            .unwrap());
+    }
+
+    let mut resp_buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 1];
+    loop {
+        match upstream.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(_) => {
+                resp_buf.push(tmp[0]);
+                if resp_buf.len() >= 4 && &resp_buf[resp_buf.len()-4..] == b"\r\n\r\n" {
+                    break;
+                }
+            }
+            Err(e) => {
+                warn!("upstream read failed: {e}");
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Full::new(Bytes::from("upstream read failed\n")))
+                    .unwrap());
+            }
+        }
+    }
+
+    let resp_str = String::from_utf8_lossy(&resp_buf);
+    let first_line = resp_str.lines().next().unwrap_or("");
+
+    if !first_line.contains("101") {
+        info!("upstream did not upgrade: {first_line}");
+        let status_code = first_line.split_whitespace().nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(502);
+        let mut builder = Response::builder().status(status_code);
+        for line in resp_str.lines().skip(1) {
+            if line.is_empty() { break; }
+            if let Some((k, v)) = line.split_once(':') {
+                builder = builder.header(k.trim(), v.trim());
+            }
+        }
+        return Ok(builder.body(Full::new(Bytes::new())).unwrap());
+    }
+
+    let on_upgrade = hyper::upgrade::on(req);
+
+    let mut response = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for line in resp_str.lines().skip(1) {
+        if line.is_empty() { break; }
+        if let Some((k, v)) = line.split_once(':') {
+            response = response.header(k.trim(), v.trim());
+        }
+    }
+
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                let mut client_io = hyper_util::rt::TokioIo::new(upgraded);
+                let (mut cr, mut cw) = tokio::io::split(&mut client_io);
+                let (mut ur, mut uw) = tokio::io::split(&mut upstream);
+                let c2u = tokio::io::copy(&mut cr, &mut uw);
+                let u2c = tokio::io::copy(&mut ur, &mut cw);
+                tokio::select! {
+                    r = c2u => { if let Err(e) = r { info!("ws client→upstream closed: {e}"); } }
+                    r = u2c => { if let Err(e) = r { info!("ws upstream→client closed: {e}"); } }
+                }
+            }
+            Err(e) => warn!("upgrade failed: {e}"),
+        }
+    });
+
+    Ok(response.body(Full::new(Bytes::new())).unwrap())
+}
+
+async fn proxy_upgrade(
+    req: Request<Incoming>,
+    host: &str,
+    _uri: &str,
+    addr: SocketAddr,
+    tls: bool,
+    tls_incoming: bool,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/").to_string();
+    let bad_gw = |msg: &str| {
+        Ok(Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Full::new(Bytes::from(msg.to_string())))
+            .unwrap())
+    };
+
+    if tls {
+        let tcp = match tokio::net::TcpStream::connect(addr).await {
+            Ok(t) => t,
+            Err(e) => { warn!("upstream connect failed: {e}"); return bad_gw("upstream connect failed\n"); }
+        };
+        let tls_config = make_tls_config();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        let server_name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
+        match connector.connect(server_name, tcp).await {
+            Ok(tls_stream) => ws_handshake_and_tunnel(req, host, &path, tls_incoming, tls_stream).await,
+            Err(e) => { warn!("upstream TLS failed: {e}"); bad_gw("upstream TLS error\n") }
+        }
+    } else {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(tcp) => ws_handshake_and_tunnel(req, host, &path, tls_incoming, tcp).await,
+            Err(e) => { warn!("upstream connect failed: {e}"); bad_gw("upstream connect failed\n") }
+        }
+    }
+}
+
 async fn proxy_request(
     client: Client,
     table: RouteTable,
@@ -312,6 +453,13 @@ async fn proxy_request(
         proxy_req = proxy_req.header("x-forwarded-port", "443");
     } else {
         proxy_req = proxy_req.header("x-forwarded-proto", "http");
+    }
+
+    let is_upgrade = req.headers().get("upgrade").is_some();
+
+    if is_upgrade {
+        info!(host, uri = %uri, "proxying WebSocket upgrade");
+        return proxy_upgrade(req, &host, &uri, addr, backend_ref.tls, tls_incoming).await;
     }
 
     let body = req.collect().await?.to_bytes();
@@ -440,6 +588,7 @@ pub async fn run(client: Client, port: u16, ca: Arc<CaState>) -> anyhow::Result<
 
                 if let Err(e) = http1::Builder::new()
                     .serve_connection(hyper_util::rt::TokioIo::new(tls_stream), service)
+                    .with_upgrades()
                     .await
                 {
                     if !e.to_string().contains("connection closed") {
@@ -463,6 +612,7 @@ pub async fn run(client: Client, port: u16, ca: Arc<CaState>) -> anyhow::Result<
 
             if let Err(e) = http1::Builder::new()
                 .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .with_upgrades()
                 .await
             {
                 warn!("connection error: {e}");

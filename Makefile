@@ -15,7 +15,7 @@ SUDO           ?= sudo
 
 .PHONY: all build-all cluster deploy setup teardown status logs \
        operator-install operator-run operator-crds dsci dsc rebuild \
-       workbench patch-gatewayconfig-tls
+       workbench patch-gatewayconfig-tls setup-admin-rbac
 
 all: build-all cluster deploy
 	@echo ""
@@ -284,6 +284,9 @@ workbench:
 
 patch-gatewayconfig-tls:
 	python3 scripts/patch-gatewayconfig-tls.py
+
+setup-admin-rbac:
+	python3 scripts/setup-admin-rbac.py
 
 # ──────────────────────────────────────────────
 # Cleanup
