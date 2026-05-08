@@ -94,7 +94,7 @@ certificate injection, and Namespace → Project mirroring.
 - **SCC Webhook** — mutating admission webhook that injects `fsGroup` into pods with `runAsNonRoot: true`, mimicking OCP's restricted SCC; also annotates namespaces with UID ranges
 - **JobSet** — partial mock of the `jobset.x-k8s.io/v1alpha2` controller; creates real `batch/v1` child Jobs from `spec.replicatedJobs` and tracks completion status
 - **ImageStream** — watches `image.openshift.io/v1` ImageStreams and populates `status.tags` from `spec.tags`, resolving `dockerImageReference` so the ODH Dashboard and notebook webhook can look up workbench images
-- **Proxy** — reverse proxy for Route hostnames (resolves `*.apps.ocp-sim.localhost` to the right backend Service)
+- **Proxy** — reverse proxy for Route hostnames (resolves `*.apps.ocp-sim.localhost` to the right backend Service); supports WebSocket upgrade tunneling for Jupyter kernel connections
 
 ## Requirements
 
@@ -108,16 +108,26 @@ certificate injection, and Namespace → Project mirroring.
 
 ```bash
 # Clone with submodules / place source dependencies in example.src/
-# (kind fork, opendatahub-operator)
+# (kind fork, opendatahub-operator, odh-dashboard)
 
 # Build everything and bring up the cluster
 sudo make all
 
-# In another terminal, run the ODH operator against the cluster
-make operator-run
+# Deploy the ODH operator into the cluster
+make operator-deploy
 
-# Create a DSC
+# Create DSCI + DSC to trigger reconciliation
+make dsci
 make dsc
+
+# Patch gateway for self-signed TLS
+make patch-gatewayconfig-tls
+
+# Set up admin RBAC (required for dashboard project listing)
+make setup-admin-rbac
+
+# Create a test workbench
+make workbench
 
 # Open the dashboard
 # https://rh-ai.apps.ocp-sim.localhost/
@@ -133,11 +143,24 @@ seed resources, loads the simulator, and installs ODH operator CRDs.
 # Rebuild simulator + redeploy without recreating the cluster
 make rebuild
 
+# Rebuild just the simulator image and restart the pod
+make deploy-sim
+
 # Hot-patch ocp-shim into the running node (no cluster recreate)
 make shim-hotpatch
 
 # Tear everything down
 make teardown
+```
+
+### Workbench management
+
+```bash
+# Create a project + workbench (defaults: project1/workbench1)
+make workbench
+
+# Custom names and image
+make workbench WORKBENCH_PROJECT=myproj WORKBENCH_NAME=wb1 WORKBENCH_IMAGE=jupyter-datascience-notebook:3.4
 ```
 
 ## Project layout
@@ -159,9 +182,14 @@ picoshift/
 │       ├── imagestream.rs # ImageStream import controller
 │       └── proxy.rs       # Reverse proxy for Route traffic
 ├── deploy/               # Kubernetes manifests for the simulator
+├── scripts/              # Python/bash helper scripts
+│   ├── create-workbench.py        # Create a project + workbench (replicates dashboard flow)
+│   ├── patch-gatewayconfig-tls.py # Disable IDP cert verification for self-signed CA
+│   ├── setup-admin-rbac.py        # Grant admin user cluster permissions
+│   └── rebuild.sh                 # Full teardown + rebuild
+├── bugs.odh/             # Documented upstream ODH bugs found during testing
 ├── tasks/                # Roadmap docs for partial → full simulation
 ├── kind/                 # kind cluster config
-├── scripts/              # rebuild.sh, teardown.sh
 └── Makefile
 ```
 
@@ -181,21 +209,42 @@ ocp-shim, the opendatahub-operator source, and optionally the ODH Dashboard.
    default SCCs).
 
 3. **ocp-sim** deploys as a DaemonSet on the control plane node. Its
-   controllers watch for Routes, Gateways, Namespaces, and JobSets, providing
-   the dynamic behavior that operators depend on: Route admission, Envoy
-   configuration, TLS certificates, Project objects, SCC-like pod mutation
-   (fsGroup injection), and JobSet child Job management.
+   controllers watch for Routes, Gateways, Namespaces, ImageStreams, and
+   JobSets, providing the dynamic behavior that operators depend on: Route
+   admission, Envoy configuration, TLS certificates, Project objects,
+   ImageStream status resolution, SCC-like pod mutation (fsGroup injection),
+   and JobSet child Job management.
 
 4. With the simulated control plane in place, the ODH operator starts, detects
    "OpenShift", and reconciles normally. The Dashboard gets a working Gateway
    with OAuth, WebSocket support, and TLS — enough to develop and test against
    without a real OCP cluster.
 
+## What's running
+
+Once fully deployed, the cluster runs the following workloads:
+
+| Namespace | Component | Description |
+|-----------|-----------|-------------|
+| `ocp-sim` | ocp-sim DaemonSet | All simulated OCP controllers + reverse proxy |
+| `openshift-ingress` | data-science-gateway (Envoy) | Gateway API data plane, TLS termination |
+| `openshift-ingress` | kube-auth-proxy | OAuth2 ext_authz filter for Envoy |
+| `opendatahub-operator-system` | ODH operator | Reconciles DSC/DSCI into component deployments |
+| `opendatahub` | odh-dashboard (×2) | Dashboard UI (9 sidecar containers per pod) |
+| `opendatahub` | notebook-controller | Upstream Kubeflow notebook controller |
+| `opendatahub` | odh-notebook-controller | ODH notebook controller (webhook, RBAC, HTTPRoute) |
+| `opendatahub` | kserve, kuberay, feast, trustyai, etc. | Model serving and ML platform operators |
+| `opendatahub` | data-science-pipelines-operator | Pipeline orchestration |
+| `odh-model-registries` | model-catalog + postgres | Model registry with backing database |
+| `project1` | workbench1 (StatefulSet) | Jupyter notebook + kube-rbac-proxy sidecar |
+
 ## Status
 
 Early stage. The opendatahub-operator and ODH Dashboard both start and function
-against picoshift. Coverage of OpenShift APIs will expand as more operators are
-tested.
+against picoshift. Jupyter workbenches can be created through the dashboard or
+CLI, with full OAuth login, kube-rbac-proxy sidecar injection, and WebSocket
+support for kernel connections. Coverage of OpenShift APIs will expand as more
+operators are tested.
 
 ## License
 
