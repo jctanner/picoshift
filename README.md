@@ -32,12 +32,12 @@ graph TB
         subgraph gw ["Gateway (Envoy)"]
             envoy["Envoy"]
             kubeauth["kube-auth-proxy"]
-            kuberbac["kube-rbac-proxy"]
         end
 
         subgraph workloads ["Operator Workloads"]
             odhop["opendatahub-operator"]
-            dashboard["ODH Dashboard"]
+            dashboard["ODH Dashboard<br/><i>+ kube-rbac-proxy sidecar</i>"]
+            notebook["Workbench Pod<br/><i>Jupyter + kube-rbac-proxy</i>"]
         end
 
         crds[("OpenShift CRDs<br/>+ seed resources")]
@@ -53,11 +53,10 @@ graph TB
         oauthctrl -->|"issue JWTs"| kubeauth
 
         odhop -->|"reconcile CRs"| ocpshim
-        dashboard --> kuberbac
-        kuberbac --> dashboard
 
         envoy -->|"ext_authz"| kubeauth
-        envoy --> kuberbac
+        envoy -->|"route traffic"| dashboard
+        envoy -->|"route traffic"| notebook
     end
 
     browser -->|":443"| proxy
