@@ -40,13 +40,13 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["namespaces"]
-    verbs: ["get", "list", "watch", "create"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: ["project.openshift.io"]
     resources: ["projects", "projects/status"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: ["admissionregistration.k8s.io"]
     resources: ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"]
-    verbs: ["get", "list", "watch", "update", "patch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch", "delete"]
@@ -99,6 +99,9 @@ spec:
               protocol: TCP
             - containerPort: 443
               hostPort: 443
+              protocol: TCP
+            - containerPort: 8443
+              hostPort: 8443
               protocol: TCP
             - containerPort: 9443
               hostPort: 9443

@@ -1,5 +1,6 @@
 mod gateway;
 mod oauth;
+mod pod_mutate;
 mod project;
 mod proxy;
 mod route;
@@ -76,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
     let gw_handle = tokio::spawn(gateway::run(client.clone()));
     let oauth_handle = tokio::spawn(oauth::run(client.clone(), ca.clone()));
     let proj_handle = tokio::spawn(project::run(client.clone()));
+    let scc_handle = tokio::spawn(pod_mutate::run(client.clone(), ca.clone()));
 
     if args.proxy {
         info!(port = args.proxy_port, "starting reverse proxy");
@@ -90,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
             res = gw_handle => if let Ok(Err(e)) = res { error!(%e, "gateway controller failed"); },
             res = oauth_handle => if let Ok(Err(e)) = res { error!(%e, "oauth server failed"); },
             res = proj_handle => if let Ok(Err(e)) = res { error!(%e, "project controller failed"); },
+            res = scc_handle => if let Ok(Err(e)) = res { error!(%e, "scc webhook failed"); },
             res = proxy_handle => if let Ok(Err(e)) = res { error!(%e, "proxy failed"); },
         }
     } else {
@@ -102,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
             res = gw_handle => if let Ok(Err(e)) = res { error!(%e, "gateway controller failed"); },
             res = oauth_handle => if let Ok(Err(e)) = res { error!(%e, "oauth server failed"); },
             res = proj_handle => if let Ok(Err(e)) = res { error!(%e, "project controller failed"); },
+            res = scc_handle => if let Ok(Err(e)) = res { error!(%e, "scc webhook failed"); },
         }
     }
 
