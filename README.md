@@ -24,6 +24,8 @@ graph TB
             oauthctrl["OAuth Server"]
             projectctrl["Project Controller"]
             serviceca["Service CA"]
+            sccwebhook["SCC Webhook<br/><i>MutatingAdmission</i>"]
+            jobsetctrl["JobSet Controller"]
         end
 
         subgraph gw ["Gateway (Envoy)"]
@@ -44,6 +46,8 @@ graph TB
         gwctrl -->|"watch HTTPRoutes"| apiserver
         projectctrl -->|"mirror Namespaces<br/>→ Projects"| apiserver
         serviceca -->|"inject TLS certs"| apiserver
+        sccwebhook -->|"mutate pods<br/>inject fsGroup"| apiserver
+        jobsetctrl -->|"watch JobSets<br/>create child Jobs"| apiserver
         oauthctrl -->|"issue JWTs"| kubeauth
 
         odhop -->|"reconcile CRs"| ocpshim
@@ -74,8 +78,8 @@ certificate injection, and Namespace → Project mirroring.
 |-----------|-------------|
 | **kind cluster** | Single-node Kubernetes with port mappings for 80/443/9443 |
 | **ocp-shim** | Go sidecar baked into the kind node image — intercepts the API server to serve OpenShift discovery endpoints (`/apis/project.openshift.io`, `/.well-known/oauth-authorization-server`, etc.) |
-| **OpenShift CRDs** | Routes, Projects, SCCs, ClusterVersion, OLM types, and more |
-| **Seed resources** | ClusterVersion, Infrastructure, Ingress, Authentication, default SCCs — everything operators probe at startup |
+| **OpenShift CRDs** | Routes, Projects, SCCs, ClusterVersion, OLM types, Gateway API, JobSet, and more |
+| **Seed resources** | ClusterVersion, Infrastructure, Ingress, Authentication, default SCCs, JobSet operator — everything operators probe at startup |
 | **ocp-sim** | Rust controller (kube-rs) running as a DaemonSet with `hostNetwork: true` |
 
 ### ocp-sim controllers
@@ -85,6 +89,8 @@ certificate injection, and Namespace → Project mirroring.
 - **OAuth** — serves `/oauth/authorize` and `/oauth/token` endpoints backed by static users, issues JWTs
 - **Project** — mirrors every Namespace as a `project.openshift.io/v1` Project
 - **Service CA** — injects TLS certificates into annotated Services and their corresponding Secrets
+- **SCC Webhook** — mutating admission webhook that injects `fsGroup` into pods with `runAsNonRoot: true`, mimicking OCP's restricted SCC; also annotates namespaces with UID ranges
+- **JobSet** — partial mock of the `jobset.x-k8s.io/v1alpha2` controller; creates real `batch/v1` child Jobs from `spec.replicatedJobs` and tracks completion status
 - **Proxy** — reverse proxy for Route hostnames (resolves `*.apps.ocp-sim.localhost` to the right backend Service)
 
 ## Requirements
@@ -140,13 +146,16 @@ picoshift/
 ├── simulator/            # Rust project — the ocp-sim binary
 │   └── src/
 │       ├── main.rs
-│       ├── route.rs      # Route admission controller
-│       ├── gateway.rs    # Gateway API → Envoy xDS
-│       ├── oauth.rs      # OAuth2 token server
-│       ├── project.rs    # Namespace → Project sync
-│       ├── service_ca.rs # Service CA certificate injection
-│       └── proxy.rs      # Reverse proxy for Route traffic
+│       ├── route.rs       # Route admission controller
+│       ├── gateway.rs     # Gateway API → Envoy xDS
+│       ├── oauth.rs       # OAuth2 token server
+│       ├── project.rs     # Namespace → Project sync
+│       ├── service_ca.rs  # Service CA certificate injection
+│       ├── pod_mutate.rs  # SCC-like mutating webhook + namespace UID ranges
+│       ├── jobset.rs      # JobSet mock controller
+│       └── proxy.rs       # Reverse proxy for Route traffic
 ├── deploy/               # Kubernetes manifests for the simulator
+├── tasks/                # Roadmap docs for partial → full simulation
 ├── kind/                 # kind cluster config
 ├── scripts/              # rebuild.sh, teardown.sh
 └── Makefile
@@ -168,9 +177,10 @@ ocp-shim, the opendatahub-operator source, and optionally the ODH Dashboard.
    default SCCs).
 
 3. **ocp-sim** deploys as a DaemonSet on the control plane node. Its
-   controllers watch for Routes, Gateways, and Namespaces, providing the
-   dynamic behavior that operators depend on: Route admission, Envoy
-   configuration, TLS certificates, and Project objects.
+   controllers watch for Routes, Gateways, Namespaces, and JobSets, providing
+   the dynamic behavior that operators depend on: Route admission, Envoy
+   configuration, TLS certificates, Project objects, SCC-like pod mutation
+   (fsGroup injection), and JobSet child Job management.
 
 4. With the simulated control plane in place, the ODH operator starts, detects
    "OpenShift", and reconciles normally. The Dashboard gets a working Gateway

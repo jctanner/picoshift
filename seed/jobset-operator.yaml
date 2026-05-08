@@ -1,0 +1,12 @@
+apiVersion: operators.coreos.com/v2
+kind: OperatorCondition
+metadata:
+  name: jobset-operator.v0.11.1
+  namespace: openshift-operators
+---
+apiVersion: operator.openshift.io/v1
+kind: JobSetOperator
+metadata:
+  name: cluster
+spec:
+  managementState: Managed

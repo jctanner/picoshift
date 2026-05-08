@@ -113,6 +113,7 @@ deploy-crds:
 	kubectl apply -f crds/gateway/
 	kubectl apply -f crds/monitoring/
 	kubectl apply -f crds/istio/
+	kubectl apply --server-side -f crds/jobset/
 	kubectl wait --for=condition=Established crd --all --timeout=30s
 
 deploy-seed: deploy-seed-resources deploy-clusterversion deploy-endpoint-patch
@@ -124,6 +125,7 @@ deploy-seed-resources:
 	kubectl apply -f seed/ingress.yaml
 	kubectl apply -f seed/infrastructure.yaml
 	kubectl apply -f seed/sccs.yaml
+	kubectl apply -f seed/jobset-operator.yaml
 
 deploy-endpoint-patch:
 	@# Route in-cluster kubernetes service traffic through the ocp-shim (port 6443)
