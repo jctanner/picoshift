@@ -59,6 +59,9 @@ rules:
   - apiGroups: ["jobset.x-k8s.io"]
     resources: ["jobsets", "jobsets/status"]
     verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["image.openshift.io"]
+    resources: ["imagestreams", "imagestreams/status"]
+    verbs: ["get", "list", "watch", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

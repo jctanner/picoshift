@@ -26,6 +26,7 @@ graph TB
             serviceca["Service CA"]
             sccwebhook["SCC Webhook<br/><i>MutatingAdmission</i>"]
             jobsetctrl["JobSet Controller"]
+            isctrl["ImageStream Controller"]
         end
 
         subgraph gw ["Gateway (Envoy)"]
@@ -48,6 +49,7 @@ graph TB
         serviceca -->|"inject TLS certs"| apiserver
         sccwebhook -->|"mutate pods<br/>inject fsGroup"| apiserver
         jobsetctrl -->|"watch JobSets<br/>create child Jobs"| apiserver
+        isctrl -->|"watch ImageStreams<br/>populate status.tags"| apiserver
         oauthctrl -->|"issue JWTs"| kubeauth
 
         odhop -->|"reconcile CRs"| ocpshim
@@ -91,6 +93,7 @@ certificate injection, and Namespace → Project mirroring.
 - **Service CA** — injects TLS certificates into annotated Services and their corresponding Secrets
 - **SCC Webhook** — mutating admission webhook that injects `fsGroup` into pods with `runAsNonRoot: true`, mimicking OCP's restricted SCC; also annotates namespaces with UID ranges
 - **JobSet** — partial mock of the `jobset.x-k8s.io/v1alpha2` controller; creates real `batch/v1` child Jobs from `spec.replicatedJobs` and tracks completion status
+- **ImageStream** — watches `image.openshift.io/v1` ImageStreams and populates `status.tags` from `spec.tags`, resolving `dockerImageReference` so the ODH Dashboard and notebook webhook can look up workbench images
 - **Proxy** — reverse proxy for Route hostnames (resolves `*.apps.ocp-sim.localhost` to the right backend Service)
 
 ## Requirements
@@ -153,6 +156,7 @@ picoshift/
 │       ├── service_ca.rs  # Service CA certificate injection
 │       ├── pod_mutate.rs  # SCC-like mutating webhook + namespace UID ranges
 │       ├── jobset.rs      # JobSet mock controller
+│       ├── imagestream.rs # ImageStream import controller
 │       └── proxy.rs       # Reverse proxy for Route traffic
 ├── deploy/               # Kubernetes manifests for the simulator
 ├── tasks/                # Roadmap docs for partial → full simulation
