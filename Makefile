@@ -15,7 +15,8 @@ SUDO           ?= sudo
 
 .PHONY: all build-all cluster deploy setup teardown status logs \
        operator-install operator-run operator-crds dsci dsc rebuild \
-       workbench patch-gatewayconfig-tls setup-admin-rbac
+       workbench patch-gatewayconfig-tls setup-admin-rbac \
+       deploy-model-serving deploy-fraud-tutorial
 
 all: build-all cluster deploy
 	@echo ""
@@ -287,6 +288,18 @@ patch-gatewayconfig-tls:
 
 setup-admin-rbac:
 	python3 scripts/setup-admin-rbac.py
+
+# ──────────────────────────────────────────────
+# Model Serving
+# ──────────────────────────────────────────────
+
+.PHONY: deploy-model-serving
+
+deploy-model-serving:
+	python3 scripts/deploy-model-serving.py
+
+deploy-fraud-tutorial:
+	cd odh.mcp && .venv/bin/python ../scripts/deploy-fraud-tutorial.py
 
 # ──────────────────────────────────────────────
 # Cleanup

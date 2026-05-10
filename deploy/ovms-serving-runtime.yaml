@@ -1,0 +1,47 @@
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: kserve-ovms
+  namespace: fraud-detection
+  annotations:
+    openshift.io/display-name: OpenVINO Model Server
+  labels:
+    opendatahub.io/dashboard: "true"
+spec:
+  multiModel: false
+  supportedModelFormats:
+  - name: openvino_ir
+    version: opset13
+    autoSelect: true
+  - name: onnx
+    version: "1"
+    autoSelect: true
+  - name: tensorflow
+    version: "1"
+    autoSelect: true
+  - name: tensorflow
+    version: "2"
+    autoSelect: true
+  protocolVersions:
+  - v2
+  - grpc-v2
+  containers:
+  - name: kserve-container
+    image: quay.io/opendatahub/openvino_model_server:2025.1-release
+    args:
+    - --model_name={{.Name}}
+    - --port=8001
+    - --rest_port=8888
+    - --model_path=/mnt/models
+    - --file_system_poll_wait_seconds=0
+    - --metrics_enable
+    ports:
+    - containerPort: 8888
+      protocol: TCP
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi

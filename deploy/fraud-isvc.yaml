@@ -1,0 +1,22 @@
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: fraud
+  namespace: fraud-detection
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: onnx
+        version: "1"
+      protocolVersion: v2
+      storageUri: "s3://models/models/fraud"
+      storage:
+        key: "my-storage"
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
