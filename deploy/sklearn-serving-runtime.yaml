@@ -1,0 +1,33 @@
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: kserve-sklearnserver
+  namespace: project1
+  annotations:
+    serving.kserve.io/server-type: sklearnserver
+spec:
+  annotations:
+    prometheus.kserve.io/port: "8080"
+    prometheus.kserve.io/path: "/metrics"
+  supportedModelFormats:
+  - name: sklearn
+    version: "1"
+    autoSelect: true
+    priority: 1
+  protocolVersions:
+  - v1
+  - v2
+  containers:
+  - name: kserve-container
+    image: docker.io/kserve/sklearnserver:v0.14.1
+    args:
+    - --model_name={{.Name}}
+    - --model_dir=/mnt/models
+    - --http_port=8080
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi

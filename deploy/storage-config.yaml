@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: storage-config
+  namespace: project1
+type: Opaque
+stringData:
+  seaweedfs: |
+    {
+      "type": "s3",
+      "access_key_id": "picoshift",
+      "secret_access_key": "picoshift-secret",
+      "endpoint_url": "http://seaweedfs.seaweedfs.svc.cluster.local:8333",
+      "bucket": "models",
+      "region": "us-east-1",
+      "anonymous": "False"
+    }

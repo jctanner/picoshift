@@ -1,0 +1,37 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: s3-init
+  namespace: seaweedfs
+spec:
+  template:
+    spec:
+      containers:
+      - name: s3-init
+        image: docker.io/amazon/aws-cli:2.33.11
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          aws s3 mb s3://models || true
+          curl -L https://storage.googleapis.com/kfserving-examples/models/sklearn/1.0/model/model.joblib \
+            -o /tmp/model.joblib
+          aws s3 cp /tmp/model.joblib s3://models/sklearn/linear/model.joblib --no-verify-ssl
+          echo "=== Bucket contents ==="
+          aws s3 ls s3://models/sklearn/linear/
+        env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: seaweedfs-creds
+              key: accesskey
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: seaweedfs-creds
+              key: secretkey
+        - name: AWS_DEFAULT_REGION
+          value: "us-east-1"
+        - name: AWS_ENDPOINT_URL_S3
+          value: "http://seaweedfs.seaweedfs.svc.cluster.local:8333"
+      restartPolicy: Never
+  backoffLimit: 3

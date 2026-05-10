@@ -1,0 +1,21 @@
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: sklearn-linear
+  namespace: project1
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: sklearn
+        version: "1"
+      storageUri: "s3://models/sklearn/linear"
+      storage:
+        key: "seaweedfs"
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi

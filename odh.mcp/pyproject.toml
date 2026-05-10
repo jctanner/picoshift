@@ -1,0 +1,18 @@
+[project]
+name = "odh-mcp"
+version = "0.1.0"
+description = "MCP server for orchestrating ODH workbenches and model serving on picoshift"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.10.1",
+    "jupyter-kernel-client>=0.9.0",
+    "jupyter-server-client>=0.1.1",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+odh-mcp = "odh_mcp.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
