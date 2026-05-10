@@ -116,6 +116,9 @@ deploy-crds:
 	kubectl apply -f crds/monitoring/
 	kubectl apply -f crds/istio/
 	kubectl apply --server-side -f crds/jobset/
+	kubectl apply -f crds/maas/
+	kubectl apply -f crds/authorino/
+	kubectl apply -f crds/kuadrant/
 	kubectl wait --for=condition=Established crd --all --timeout=30s
 
 deploy-seed: deploy-seed-resources deploy-clusterversion deploy-endpoint-patch
@@ -128,6 +131,8 @@ deploy-seed-resources:
 	kubectl apply -f seed/infrastructure.yaml
 	kubectl apply -f seed/sccs.yaml
 	kubectl apply -f seed/jobset-operator.yaml
+	kubectl apply -f seed/rbac-compat.yaml
+	kubectl apply -f seed/maas.yaml
 
 deploy-endpoint-patch:
 	@# Route in-cluster kubernetes service traffic through the ocp-shim (port 6443)
@@ -217,7 +222,7 @@ OPERATOR_NAMESPACE := opendatahub-operator-system
 
 .PHONY: operator-crds operator-run operator-image operator-load \
         operator-deploy operator-redeploy operator-logs \
-        dsci dsc operator-install
+        dsci dsc dsc-enable-maas operator-install
 
 operator-crds:
 	$(MAKE) -C $(ODH_DIR) manifests
@@ -266,6 +271,10 @@ dsci:
 
 dsc:
 	kubectl apply -f $(ODH_DIR)/config/samples/datasciencecluster_v2_datasciencecluster.yaml
+
+dsc-enable-maas:
+	kubectl patch datasciencecluster default-dsc --type=merge \
+		-p '{"spec":{"components":{"kserve":{"modelsAsService":{"managementState":"Managed"}}}}}'
 
 # ──────────────────────────────────────────────
 # Workbench
