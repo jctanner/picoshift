@@ -58,6 +58,7 @@ help:
 	@echo "  dsci               Create DSCInitialization + patch GatewayConfig TLS"
 	@echo "  dsc                Create DataScienceCluster"
 	@echo "  dsc-enable-maas    Enable Models-as-a-Service in the DSC"
+	@echo "  patch-authorino-ca Inject Service CA into Authorino for MaaS API trust"
 	@echo ""
 	@echo "Workbench & Model Serving:"
 	@echo "  workbench          Create a workbench (WORKBENCH_PROJECT, WORKBENCH_NAME, WORKBENCH_IMAGE)"
@@ -285,7 +286,7 @@ OPERATOR_NAMESPACE := opendatahub-operator-system
 
 .PHONY: operator-crds operator-run operator-image operator-load \
         operator-deploy operator-redeploy operator-logs \
-        dsci dsc dsc-enable-maas operator-install
+        dsci dsc dsc-enable-maas patch-authorino-ca operator-install
 
 operator-crds:
 	$(MAKE) -C $(ODH_DIR) manifests
@@ -346,6 +347,24 @@ dsc:
 dsc-enable-maas:
 	kubectl patch datasciencecluster default-dsc --type=merge \
 		-p '{"spec":{"components":{"kserve":{"modelsAsService":{"managementState":"Managed"}}}}}'
+
+patch-authorino-ca:
+	@# Ensure odh-trusted-ca-bundle ConfigMap exists in kuadrant-system with
+	@# the inject label so the Service CA controller populates it.
+	kubectl apply -f - <<< '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"odh-trusted-ca-bundle","namespace":"kuadrant-system","labels":{"config.openshift.io/inject-trusted-cabundle":"true","app.kubernetes.io/part-of":"opendatahub-operator"}}}'
+	@echo "Waiting for Service CA to inject into odh-trusted-ca-bundle..."
+	@for i in $$(seq 1 15); do \
+		LEN=$$(kubectl get cm odh-trusted-ca-bundle -n kuadrant-system -o jsonpath='{.data.odh-ca-bundle\.crt}' 2>/dev/null | wc -c); \
+		if [ "$$LEN" -gt 10 ]; then echo "CA cert injected ($$LEN bytes)"; break; fi; \
+		sleep 2; \
+	done
+	@# Patch Authorino CR to mount the CA bundle (no subPath — auto-updates)
+	kubectl patch authorino authorino -n kuadrant-system --type=merge \
+		-p '{"spec":{"volumes":{"items":[{"name":"odh-ca","mountPath":"/etc/ssl/custom-certs","configMaps":["odh-trusted-ca-bundle"]}]}}}'
+	@# Set SSL_CERT_FILE so Go's x509 package trusts our Service CA
+	kubectl set env deployment/authorino -n kuadrant-system \
+		SSL_CERT_FILE=/etc/ssl/custom-certs/odh-ca-bundle.crt
+	kubectl rollout status deployment/authorino -n kuadrant-system --timeout=60s
 
 # ──────────────────────────────────────────────
 # Workbench
@@ -427,6 +446,11 @@ kuadrant:
 	helm upgrade --install kuadrant kuadrant/kuadrant-operator \
 		--namespace kuadrant-system --create-namespace \
 		--wait --timeout 180s
+	kubectl set env deployment/kuadrant-operator-controller-manager \
+		-n kuadrant-system \
+		ISTIO_GATEWAY_CONTROLLER_NAMES="openshift.io/gateway-controller/v1"
+	kubectl rollout status deployment/kuadrant-operator-controller-manager \
+		-n kuadrant-system --timeout=60s
 	kubectl apply -f - <<< '{"apiVersion":"kuadrant.io/v1beta1","kind":"Kuadrant","metadata":{"name":"kuadrant","namespace":"kuadrant-system"},"spec":{}}'
 	@echo "Waiting for Kuadrant to become ready..."
 	@for i in $$(seq 1 30); do \

@@ -35,7 +35,8 @@ fn generate_serving_cert(
     );
     let issuer = Issuer::from_params(&ca_params, &ca_key);
 
-    let mut params = CertificateParams::new(vec![cn.to_string()])?;
+    let fqdn = format!("{cn}.cluster.local");
+    let mut params = CertificateParams::new(vec![cn.to_string(), fqdn])?;
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
         rcgen::DnValue::Utf8String(cn.into()),
@@ -153,19 +154,33 @@ async fn reconcile_configmap(
     let (client, ca) = ctx.as_ref();
 
     let annotations = cm.metadata.annotations.as_ref();
-    let should_inject = annotations
+    let labels = cm.metadata.labels.as_ref();
+
+    let inject_serving = annotations
         .and_then(|a| a.get(INJECT_CABUNDLE_ANNOTATION))
         .map(|v| v == "true")
         .unwrap_or(false);
 
-    if !should_inject {
+    let inject_trusted = labels
+        .and_then(|l| l.get("config.openshift.io/inject-trusted-cabundle"))
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    if !inject_serving && !inject_trusted {
         return Ok(Action::await_change());
     }
+
+    let target_key = if inject_trusted {
+        "odh-ca-bundle.crt"
+    } else {
+        "service-ca.crt"
+    };
 
     let has_ca_key = cm
         .data
         .as_ref()
-        .map(|d| d.contains_key("service-ca.crt"))
+        .and_then(|d| d.get(target_key))
+        .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
 
     if has_ca_key {
@@ -178,7 +193,7 @@ async fn reconcile_configmap(
     let cms: Api<ConfigMap> = Api::namespaced(client.clone(), &ns);
     let patch = serde_json::json!({
         "data": {
-            "service-ca.crt": ca.ca_cert_pem
+            target_key: ca.ca_cert_pem
         }
     });
 
