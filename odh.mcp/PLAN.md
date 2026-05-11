@@ -154,7 +154,7 @@ class CellResult:
 
 ## How it connects to the workbench
 
-The workbench runs at `https://rh-ai.apps.ocp-sim.localhost/notebook/fraud-detection/fraud-detection/`. The Jupyter REST API is at that base URL + `/api/...`.
+The workbench runs at `https://rh-ai.apps.ocp-sim.test/notebook/fraud-detection/fraud-detection/`. The Jupyter REST API is at that base URL + `/api/...`.
 
 The `jupyter-server-client` library handles:
 - `GET /api/contents/{path}` — read notebook JSON
@@ -174,14 +174,14 @@ This exercises the full proxy → WebSocket → kernel stack.
 ```bash
 cd odh.mcp && pip install -e .
 # Add to Claude Code MCP config:
-# odh-mcp --workbench-url https://rh-ai.apps.ocp-sim.localhost/notebook/fraud-detection/fraud-detection
+# odh-mcp --workbench-url https://rh-ai.apps.ocp-sim.test/notebook/fraud-detection/fraud-detection
 ```
 
 **As library from scripts:**
 ```python
 from odh_mcp.notebook import NotebookRunner
 
-runner = NotebookRunner("https://rh-ai.apps.ocp-sim.localhost/notebook/fraud-detection/fraud-detection")
+runner = NotebookRunner("https://rh-ai.apps.ocp-sim.test/notebook/fraud-detection/fraud-detection")
 await runner.start_kernel()
 results = await runner.execute_all("fraud-detection/1_experiment_train.ipynb")
 for r in results:
@@ -207,14 +207,14 @@ cd odh.mcp && pip install -e .
 make workbench WORKBENCH_PROJECT=fraud-detection WORKBENCH_IMAGE=jupyter-tensorflow-notebook:3.4
 
 # 3. Test the MCP server
-odh-mcp --workbench-url https://rh-ai.apps.ocp-sim.localhost/notebook/fraud-detection/fraud-detection
+odh-mcp --workbench-url https://rh-ai.apps.ocp-sim.test/notebook/fraud-detection/fraud-detection
 
 # 4. From another terminal, test with MCP client or use as library:
 python -c "
 import asyncio
 from odh_mcp.notebook import NotebookRunner
 async def test():
-    r = NotebookRunner('https://rh-ai.apps.ocp-sim.localhost/notebook/fraud-detection/fraud-detection')
+    r = NotebookRunner('https://rh-ai.apps.ocp-sim.test/notebook/fraud-detection/fraud-detection')
     await r.start_kernel()
     result = await r.execute_code('print(\"hello from picoshift\")')
     print(result)

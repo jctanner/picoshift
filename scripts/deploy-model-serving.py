@@ -116,11 +116,11 @@ def patch_ingress_domain():
     cm = json.loads(result.stdout)
     ingress = json.loads(cm["data"]["ingress"])
 
-    if ingress.get("ingressDomain") == "apps.ocp-sim.localhost":
+    if ingress.get("ingressDomain") == "apps.ocp-sim.test":
         print("  Already patched")
         return
 
-    ingress["ingressDomain"] = "apps.ocp-sim.localhost"
+    ingress["ingressDomain"] = "apps.ocp-sim.test"
     cm["data"]["ingress"] = json.dumps(ingress)
 
     kubectl("apply", "-f", "-", input=json.dumps(cm))

@@ -16,7 +16,8 @@ SUDO           ?= sudo
 .PHONY: all build-all cluster deploy setup teardown status logs \
        operator-install operator-run operator-crds dsci dsc rebuild \
        workbench patch-gatewayconfig-tls setup-admin-rbac \
-       deploy-model-serving deploy-fraud-tutorial
+       deploy-model-serving deploy-fraud-tutorial \
+       gateway-stack gateway-api cert-manager istio kuadrant
 
 all: build-all cluster deploy
 	@echo ""
@@ -24,7 +25,7 @@ all: build-all cluster deploy
 	@echo "  kubectl get --raw /.well-known/oauth-authorization-server | jq ."
 	@echo "  make status"
 	@echo "  make logs"
-	@echo "  https://rh-ai.apps.ocp-sim.localhost/"
+	@echo "  https://rh-ai.apps.ocp-sim.test/"
 
 rebuild:
 	bash scripts/rebuild.sh
@@ -105,18 +106,19 @@ cluster-delete:
 # Deploy (CRDs + seed + simulator)
 # ──────────────────────────────────────────────
 
-.PHONY: deploy deploy-crds deploy-seed deploy-sim redeploy
+.PHONY: deploy deploy-crds deploy-seed deploy-sim deploy-maas redeploy
 
-deploy: deploy-crds deploy-seed deploy-sim
+deploy: deploy-crds deploy-seed deploy-sim setup-admin-rbac
 
 deploy-crds:
+	@echo "Waiting for API server..."
+	@kubectl wait --for=condition=Ready node --all --timeout=120s
 	kubectl apply -f crds/openshift/
 	kubectl apply -f crds/olm/
 	kubectl apply -f crds/gateway/
 	kubectl apply -f crds/monitoring/
 	kubectl apply -f crds/istio/
 	kubectl apply --server-side -f crds/jobset/
-	kubectl apply -f crds/maas/
 	kubectl apply -f crds/authorino/
 	kubectl apply -f crds/kuadrant/
 	kubectl wait --for=condition=Established crd --all --timeout=30s
@@ -132,7 +134,6 @@ deploy-seed-resources:
 	kubectl apply -f seed/sccs.yaml
 	kubectl apply -f seed/jobset-operator.yaml
 	kubectl apply -f seed/rbac-compat.yaml
-	kubectl apply -f seed/maas.yaml
 
 deploy-endpoint-patch:
 	@# Route in-cluster kubernetes service traffic through the ocp-shim (port 6443)
@@ -161,6 +162,11 @@ deploy-sim: sim-image sim-load
 		--for=condition=Ready pod \
 		--selector=app=ocp-sim \
 		--timeout=120s
+
+deploy-maas:
+	kubectl apply -f crds/maas/
+	kubectl wait --for=condition=Established crd --all --timeout=30s
+	kubectl apply -f seed/maas.yaml
 
 redeploy: deploy-sim
 
@@ -264,10 +270,18 @@ operator-redeploy:
 operator-logs:
 	kubectl -n $(OPERATOR_NAMESPACE) logs -l control-plane=controller-manager -c manager -f
 
-operator-install: operator-deploy dsci dsc
+operator-install: operator-deploy dsci dsc setup-admin-rbac
 
 dsci:
 	kubectl apply -f $(ODH_DIR)/config/samples/dscinitialization_v2_dscinitialization.yaml
+	@# Disable TLS verification for the OIDC provider (self-signed certs on picoshift)
+	@echo "Waiting for GatewayConfig to be created..."
+	@for i in $$(seq 1 30); do \
+		kubectl get gatewayconfig default-gateway >/dev/null 2>&1 && break; \
+		sleep 2; \
+	done
+	kubectl patch gatewayconfig default-gateway --type=merge \
+		-p '{"spec":{"verifyProviderCertificate":false}}'
 
 dsc:
 	kubectl apply -f $(ODH_DIR)/config/samples/datasciencecluster_v2_datasciencecluster.yaml
@@ -309,6 +323,74 @@ deploy-model-serving:
 
 deploy-fraud-tutorial:
 	cd odh.mcp && .venv/bin/python ../scripts/deploy-fraud-tutorial.py
+
+# ──────────────────────────────────────────────
+# Gateway Stack (Istio + Kuadrant)
+# ──────────────────────────────────────────────
+
+GATEWAY_API_VERSION ?= v1.3.0
+
+.PHONY: gateway-stack gateway-api cert-manager istio kuadrant \
+        gateway-stack-delete cert-manager-delete istio-delete kuadrant-delete
+
+gateway-stack: gateway-api cert-manager istio kuadrant
+	@echo "Gateway stack ready (cert-manager + Istio + Kuadrant)"
+
+gateway-api:
+	kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/$(GATEWAY_API_VERSION)/standard-install.yaml
+
+cert-manager:
+	helm repo add jetstack https://charts.jetstack.io --force-update
+	helm upgrade --install cert-manager jetstack/cert-manager \
+		--namespace cert-manager --create-namespace \
+		--set crds.enabled=true \
+		--wait --timeout 120s
+
+istio:
+	@# Install Istio with the "openshift-gateway" revision and OpenShift controller
+	@# name so it behaves like OSSM/Sail on real OpenShift:
+	@# - revision=openshift-gateway: matches istio.io/rev label set by ODH operator
+	@# - PILOT_GATEWAY_API_CONTROLLER_NAME: watches the same controller name ODH uses
+	@# - PILOT_ENABLE_GATEWAY_API_DEPLOYMENT_CONTROLLER: ensures gateway Deployment/Service creation
+	istioctl install --set profile=minimal \
+		--set revision=openshift-gateway \
+		--set values.pilot.resources.requests.cpu=100m \
+		--set values.pilot.resources.requests.memory=256Mi \
+		--set values.pilot.env.PILOT_GATEWAY_API_CONTROLLER_NAME="openshift.io/gateway-controller/v1" \
+		--set values.pilot.env.PILOT_ENABLE_GATEWAY_API_DEPLOYMENT_CONTROLLER=true \
+		-y
+
+kuadrant:
+	@# Remove stub CRDs that conflict with Kuadrant's own CRDs
+	-kubectl delete crd authconfigs.authorino.kuadrant.io 2>/dev/null || true
+	-kubectl delete crd authorinos.operator.authorino.kuadrant.io 2>/dev/null || true
+	-kubectl delete crd authpolicies.kuadrant.io 2>/dev/null || true
+	-kubectl delete crd tokenratelimitpolicies.kuadrant.io 2>/dev/null || true
+	helm repo add kuadrant https://kuadrant.io/helm-charts/ --force-update
+	helm upgrade --install kuadrant kuadrant/kuadrant-operator \
+		--namespace kuadrant-system --create-namespace \
+		--wait --timeout 180s
+	kubectl apply -f - <<< '{"apiVersion":"kuadrant.io/v1beta1","kind":"Kuadrant","metadata":{"name":"kuadrant","namespace":"kuadrant-system"},"spec":{}}'
+	@echo "Waiting for Kuadrant to become ready..."
+	@for i in $$(seq 1 30); do \
+		STATUS=$$(kubectl get kuadrant kuadrant -n kuadrant-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null); \
+		if [ "$$STATUS" = "True" ]; then echo "Kuadrant is ready"; break; fi; \
+		sleep 5; \
+	done
+
+gateway-stack-delete: kuadrant-delete istio-delete cert-manager-delete
+
+kuadrant-delete:
+	-helm uninstall kuadrant -n kuadrant-system 2>/dev/null || true
+	-kubectl delete namespace kuadrant-system 2>/dev/null || true
+
+istio-delete:
+	-istioctl uninstall --purge -y 2>/dev/null || true
+	-kubectl delete namespace istio-system 2>/dev/null || true
+
+cert-manager-delete:
+	-helm uninstall cert-manager -n cert-manager 2>/dev/null || true
+	-kubectl delete namespace cert-manager 2>/dev/null || true
 
 # ──────────────────────────────────────────────
 # Cleanup

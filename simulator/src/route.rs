@@ -8,7 +8,7 @@ use kube::runtime::Controller;
 use kube::{Client, ResourceExt};
 use tracing::{info, warn};
 
-const DOMAIN: &str = "apps.ocp-sim.localhost";
+const DOMAIN: &str = "apps.ocp-sim.test";
 
 fn route_api_resource() -> ApiResource {
     ApiResource {

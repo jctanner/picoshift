@@ -288,7 +288,7 @@ def main():
     print("=== Done ===")
     print(f"  Project:   {args.project}")
     print(f"  Workbench: {args.workbench}")
-    print(f"  URL:       https://rh-ai.apps.ocp-sim.localhost/notebook/{args.project}/{args.workbench}")
+    print(f"  URL:       https://rh-ai.apps.ocp-sim.test/notebook/{args.project}/{args.workbench}")
 
 
 if __name__ == "__main__":

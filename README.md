@@ -18,7 +18,7 @@ graph TB
         end
 
         subgraph sim ["ocp-sim (DaemonSet)"]
-            proxy["Reverse Proxy<br/><i>*.apps.ocp-sim.localhost</i>"]
+            proxy["Reverse Proxy<br/><i>*.apps.ocp-sim.test</i>"]
             routectrl["Route Controller"]
             gwctrl["Gateway Controller<br/><i>Envoy xDS generation</i>"]
             oauthctrl["OAuth Server"]
@@ -93,7 +93,7 @@ certificate injection, and Namespace → Project mirroring.
 - **SCC Webhook** — mutating admission webhook that injects `fsGroup` into pods with `runAsNonRoot: true`, mimicking OCP's restricted SCC; also annotates namespaces with UID ranges
 - **JobSet** — partial mock of the `jobset.x-k8s.io/v1alpha2` controller; creates real `batch/v1` child Jobs from `spec.replicatedJobs` and tracks completion status
 - **ImageStream** — watches `image.openshift.io/v1` ImageStreams and populates `status.tags` from `spec.tags`, resolving `dockerImageReference` so the ODH Dashboard and notebook webhook can look up workbench images
-- **Proxy** — reverse proxy for Route hostnames (resolves `*.apps.ocp-sim.localhost` to the right backend Service); supports WebSocket upgrade tunneling for Jupyter kernel connections
+- **Proxy** — reverse proxy for Route hostnames (resolves `*.apps.ocp-sim.test` to the right backend Service); supports WebSocket upgrade tunneling for Jupyter kernel connections
 
 ## Requirements
 
@@ -129,7 +129,7 @@ make setup-admin-rbac
 make workbench
 
 # Open the dashboard
-# https://rh-ai.apps.ocp-sim.localhost/
+# https://rh-ai.apps.ocp-sim.test/
 ```
 
 `make all` runs the full pipeline: builds the kind fork (with ocp-shim), the

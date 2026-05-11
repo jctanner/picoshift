@@ -3,7 +3,7 @@ kind: Ingress
 metadata:
   name: cluster
 spec:
-  domain: apps.ocp-sim.localhost
-  appsDomain: apps.ocp-sim.localhost
+  domain: apps.ocp-sim.test
+  appsDomain: apps.ocp-sim.test
 status:
   defaultPlacement: Workers

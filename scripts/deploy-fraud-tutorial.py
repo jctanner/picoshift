@@ -27,7 +27,7 @@ warnings.filterwarnings("ignore", message="Unverified HTTPS")
 CLUSTER_NAME = "ocp-sim"
 NAMESPACE = "fraud-detection"
 WORKBENCH = "fraud-detection"
-GATEWAY_HOST = "rh-ai.apps.ocp-sim.localhost"
+GATEWAY_HOST = "rh-ai.apps.ocp-sim.test"
 WORKBENCH_URL = f"https://{GATEWAY_HOST}/notebook/{NAMESPACE}/{WORKBENCH}"
 
 TF_IMAGE = (

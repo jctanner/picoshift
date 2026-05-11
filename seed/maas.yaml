@@ -15,7 +15,7 @@ spec:
   gatewayClassName: data-science-gateway-class
   listeners:
     - name: http
-      hostname: maas.apps.ocp-sim.localhost
+      hostname: maas.apps.ocp-sim.test
       port: 80
       protocol: HTTP
       allowedRoutes:

@@ -191,6 +191,154 @@ async fn build_route_table(client: Client, table: RouteTable) {
     }
 }
 
+fn httproute_api_resource() -> ApiResource {
+    ApiResource {
+        group: "gateway.networking.k8s.io".into(),
+        version: "v1".into(),
+        api_version: "gateway.networking.k8s.io/v1".into(),
+        kind: "HTTPRoute".into(),
+        plural: "httproutes".into(),
+    }
+}
+
+fn gateway_api_resource() -> ApiResource {
+    ApiResource {
+        group: "gateway.networking.k8s.io".into(),
+        version: "v1".into(),
+        api_version: "gateway.networking.k8s.io/v1".into(),
+        kind: "Gateway".into(),
+        plural: "gateways".into(),
+    }
+}
+
+async fn build_gateway_route_table(client: Client, table: RouteTable) {
+    let ar = httproute_api_resource();
+    let routes: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+
+    let stream = watcher::watcher(routes, watcher::Config::default())
+        .default_backoff()
+        .applied_objects();
+
+    tokio::pin!(stream);
+
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(route) => {
+                let route_ns = route.namespace().unwrap_or_default();
+
+                let hostnames: Vec<String> = route
+                    .data
+                    .get("spec")
+                    .and_then(|s| s.get("hostnames"))
+                    .and_then(|h| h.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let parent_refs = route
+                    .data
+                    .get("spec")
+                    .and_then(|s| s.get("parentRefs"))
+                    .and_then(|p| p.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+
+                for parent in &parent_refs {
+                    let gw_name = match parent.get("name").and_then(|n| n.as_str()) {
+                        Some(n) => n.to_string(),
+                        None => continue,
+                    };
+                    let gw_ns = parent
+                        .get("namespace")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or(&route_ns)
+                        .to_string();
+
+                    let mut all_hosts = hostnames.clone();
+                    if all_hosts.is_empty() {
+                        let gw_ar = gateway_api_resource();
+                        let gw_api: Api<DynamicObject> =
+                            Api::namespaced_with(client.clone(), &gw_ns, &gw_ar);
+                        if let Ok(gw) = gw_api.get(&gw_name).await {
+                            if let Some(listeners) = gw
+                                .data
+                                .get("spec")
+                                .and_then(|s| s.get("listeners"))
+                                .and_then(|l| l.as_array())
+                            {
+                                for listener in listeners {
+                                    if let Some(h) =
+                                        listener.get("hostname").and_then(|h| h.as_str())
+                                    {
+                                        all_hosts.push(h.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let svc_label =
+                        format!("gateway.networking.k8s.io/gateway-name={gw_name}");
+                    let svcs: Api<Service> = Api::namespaced(client.clone(), &gw_ns);
+                    let svc_list = svcs
+                        .list(&kube::api::ListParams::default().labels(&svc_label))
+                        .await;
+
+                    let (svc_name, svc_ns, svc_port) = match svc_list {
+                        Ok(list) => match list.items.first() {
+                            Some(svc) => {
+                                let port = svc
+                                    .spec
+                                    .as_ref()
+                                    .and_then(|s| s.ports.as_ref())
+                                    .and_then(|ports| {
+                                        ports.iter().find(|p| {
+                                            p.name.as_deref() == Some("http")
+                                                || p.port == 80
+                                        })
+                                    })
+                                    .map(|p| p.port)
+                                    .unwrap_or(80);
+                                (
+                                    svc.name_any(),
+                                    svc.namespace().unwrap_or(gw_ns.clone()),
+                                    port,
+                                )
+                            }
+                            None => continue,
+                        },
+                        Err(_) => continue,
+                    };
+
+                    for host in &all_hosts {
+                        info!(
+                            host,
+                            svc_name,
+                            svc_ns,
+                            "gateway route table updated"
+                        );
+                        table.write().await.insert(
+                            host.clone(),
+                            RouteBackend {
+                                service_name: svc_name.clone(),
+                                service_namespace: svc_ns.clone(),
+                                target_port: TargetPort::Number(svc_port),
+                                tls: false,
+                            },
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("httproute watch error: {e}");
+            }
+        }
+    }
+}
+
 async fn resolve_endpoint(
     client: &Client,
     backend: &RouteBackend,
@@ -506,7 +654,7 @@ async fn proxy_request(
 }
 
 fn generate_tls_config(ca: &CaState) -> Result<ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let cn = "*.apps.ocp-sim.localhost";
+    let cn = "*.apps.ocp-sim.test";
     let ca_key = KeyPair::from_pem(&ca.ca_key_pem)?;
     let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -543,6 +691,12 @@ pub async fn run(client: Client, port: u16, ca: Arc<CaState>) -> anyhow::Result<
     let client_clone = client.clone();
     tokio::spawn(async move {
         build_route_table(client_clone, table_clone).await;
+    });
+
+    let gw_table = table.clone();
+    let gw_client = client.clone();
+    tokio::spawn(async move {
+        build_gateway_route_table(gw_client, gw_table).await;
     });
 
     // HTTP listener

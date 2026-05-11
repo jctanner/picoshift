@@ -1,6 +1,7 @@
 mod gateway;
 mod imagestream;
 mod jobset;
+mod loadbalancer;
 mod oauth;
 mod pod_mutate;
 mod project;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use rcgen::{CertificateParams, KeyPair};
-use tracing::{info, error};
+use tracing::{info, warn, error};
 
 #[derive(Parser)]
 #[command(name = "ocp-sim", about = "OCP Lite Simulator")]
@@ -76,12 +77,22 @@ async fn main() -> anyhow::Result<()> {
     let cm_handle = tokio::spawn(service_ca::run_configmap_controller(client.clone(), ca.clone()));
     let mwc_handle = tokio::spawn(service_ca::run_mutating_webhook_controller(client.clone(), ca.clone()));
     let vwc_handle = tokio::spawn(service_ca::run_validating_webhook_controller(client.clone(), ca.clone()));
-    let gw_handle = tokio::spawn(gateway::run(client.clone()));
+    let builtin_gw = std::env::var("ENABLE_BUILTIN_GATEWAY")
+        .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+        .unwrap_or(true);
+    let gw_handle = if builtin_gw {
+        info!("built-in gateway controller enabled");
+        tokio::spawn(gateway::run(client.clone()))
+    } else {
+        warn!("built-in gateway controller disabled (ENABLE_BUILTIN_GATEWAY=false)");
+        tokio::spawn(std::future::pending())
+    };
     let oauth_handle = tokio::spawn(oauth::run(client.clone(), ca.clone()));
     let proj_handle = tokio::spawn(project::run(client.clone()));
     let scc_handle = tokio::spawn(pod_mutate::run(client.clone(), ca.clone()));
     let jobset_handle = tokio::spawn(jobset::run(client.clone()));
     let is_handle = tokio::spawn(imagestream::run(client.clone()));
+    let lb_handle = tokio::spawn(loadbalancer::run(client.clone()));
 
     if args.proxy {
         info!(port = args.proxy_port, "starting reverse proxy");
@@ -99,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
             res = scc_handle => if let Ok(Err(e)) = res { error!(%e, "scc webhook failed"); },
             res = jobset_handle => if let Ok(Err(e)) = res { error!(%e, "jobset controller failed"); },
             res = is_handle => if let Ok(Err(e)) = res { error!(%e, "imagestream controller failed"); },
+            res = lb_handle => if let Ok(Err(e)) = res { error!(%e, "loadbalancer controller failed"); },
             res = proxy_handle => if let Ok(Err(e)) = res { error!(%e, "proxy failed"); },
         }
     } else {
@@ -114,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
             res = scc_handle => if let Ok(Err(e)) = res { error!(%e, "scc webhook failed"); },
             res = jobset_handle => if let Ok(Err(e)) = res { error!(%e, "jobset controller failed"); },
             res = is_handle => if let Ok(Err(e)) = res { error!(%e, "imagestream controller failed"); },
+            res = lb_handle => if let Ok(Err(e)) = res { error!(%e, "loadbalancer controller failed"); },
         }
     }
 

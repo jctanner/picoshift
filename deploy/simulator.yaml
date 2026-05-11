@@ -17,6 +17,9 @@ rules:
   - apiGroups: [""]
     resources: ["services", "configmaps", "secrets", "endpoints"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services/status"]
+    verbs: ["get", "update", "patch"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
@@ -118,3 +121,5 @@ spec:
           env:
             - name: RUST_LOG
               value: "ocp_sim=info,kube=warn"
+            - name: ENABLE_BUILTIN_GATEWAY
+              value: "false"

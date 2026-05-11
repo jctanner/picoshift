@@ -26,7 +26,7 @@ use url::Url;
 use crate::CaState;
 
 const OAUTH_PORT: u16 = 9443;
-const DOMAIN: &str = "apps.ocp-sim.localhost";
+const DOMAIN: &str = "apps.ocp-sim.test";
 const OAUTH_HOST: &str = "oauth-openshift";
 const OAUTH_NS: &str = "openshift-authentication";
 const CODE_TTL: Duration = Duration::from_secs(300);
@@ -316,7 +316,7 @@ async fn handle_userinfo(state: &OAuthState, req: &Request<Incoming>) -> Respons
             "sub": "admin",
             "name": "admin",
             "preferred_username": "admin",
-            "email": "admin@ocp-sim.localhost"
+            "email": "admin@ocp-sim.test"
         })
         .to_string(),
     )
@@ -547,13 +547,13 @@ async fn patch_coredns(client: &Client, node_ip: &str) -> anyhow::Result<()> {
         .cloned()
         .unwrap_or_default();
 
-    if corefile.contains("apps.ocp-sim.localhost") {
-        info!("CoreDNS already patched for apps.ocp-sim.localhost");
+    if corefile.contains("apps.ocp-sim.test") {
+        info!("CoreDNS already patched for apps.ocp-sim.test");
         return Ok(());
     }
 
     let hosts_block = format!(
-        "\napps.ocp-sim.localhost:53 {{\n    hosts {{\n        {node_ip} oauth-openshift.apps.ocp-sim.localhost\n        fallthrough\n    }}\n}}\n"
+        "\napps.ocp-sim.test:53 {{\n    hosts {{\n        {node_ip} oauth-openshift.apps.ocp-sim.test\n        fallthrough\n    }}\n}}\n"
     );
     let new_corefile = format!("{corefile}{hosts_block}");
 
@@ -566,7 +566,7 @@ async fn patch_coredns(client: &Client, node_ip: &str) -> anyhow::Result<()> {
         .patch("coredns", &PatchParams::default(), &Patch::Merge(&patch))
         .await?;
 
-    info!(node_ip, "patched CoreDNS for apps.ocp-sim.localhost");
+    info!(node_ip, "patched CoreDNS for apps.ocp-sim.test");
 
     let pods: Api<k8s_openapi::api::core::v1::Pod> =
         Api::namespaced(client.clone(), "kube-system");
