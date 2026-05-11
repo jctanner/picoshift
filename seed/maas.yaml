@@ -3,6 +3,16 @@ kind: Namespace
 metadata:
   name: models-as-a-service
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maas-gateway-config
+  namespace: openshift-ingress
+data:
+  service: |
+    spec:
+      type: ClusterIP
+---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
@@ -14,6 +24,11 @@ metadata:
     istio.io/rev: openshift-gateway
 spec:
   gatewayClassName: data-science-gateway-class
+  infrastructure:
+    parametersRef:
+      group: ""
+      kind: ConfigMap
+      name: maas-gateway-config
   listeners:
     - name: https
       hostname: maas.apps.ocp-sim.test
