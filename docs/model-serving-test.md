@@ -36,7 +36,7 @@ This runs `scripts/deploy-model-serving.py` which:
 2. Deploys SeaweedFS (namespace, deployment, service)
 3. Runs an init Job to create S3 bucket and upload the example model
 4. Creates `storage-config` secret in project1
-5. Patches KServe `ingressDomain` to `apps.ocp-sim.localhost`
+5. Patches KServe `ingressDomain` to `apps.ocp-sim.test`
 6. Creates sklearn ServingRuntime in project1
 7. Creates sklearn InferenceService in project1
 8. Waits for predictor pod
