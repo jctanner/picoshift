@@ -287,25 +287,37 @@ async fn build_gateway_route_table(client: Client, table: RouteTable) {
                         .list(&kube::api::ListParams::default().labels(&svc_label))
                         .await;
 
-                    let (svc_name, svc_ns, svc_port) = match svc_list {
+                    let (svc_name, svc_ns, svc_port, svc_tls) = match svc_list {
                         Ok(list) => match list.items.first() {
                             Some(svc) => {
-                                let port = svc
+                                let ports = svc
                                     .spec
                                     .as_ref()
-                                    .and_then(|s| s.ports.as_ref())
-                                    .and_then(|ports| {
-                                        ports.iter().find(|p| {
-                                            p.name.as_deref() == Some("http")
-                                                || p.port == 80
-                                        })
+                                    .and_then(|s| s.ports.as_ref());
+                                let http_port = ports.and_then(|pp| {
+                                    pp.iter().find(|p| {
+                                        p.name.as_deref() == Some("http")
+                                            || p.port == 80
                                     })
-                                    .map(|p| p.port)
-                                    .unwrap_or(80);
+                                });
+                                let https_port = ports.and_then(|pp| {
+                                    pp.iter().find(|p| {
+                                        p.name.as_deref() == Some("https")
+                                            || p.port == 443
+                                    })
+                                });
+                                let (port, tls) = if let Some(p) = https_port {
+                                    (p.port, true)
+                                } else if let Some(p) = http_port {
+                                    (p.port, false)
+                                } else {
+                                    (80, false)
+                                };
                                 (
                                     svc.name_any(),
                                     svc.namespace().unwrap_or(gw_ns.clone()),
                                     port,
+                                    tls,
                                 )
                             }
                             None => continue,
@@ -326,7 +338,7 @@ async fn build_gateway_route_table(client: Client, table: RouteTable) {
                                 service_name: svc_name.clone(),
                                 service_namespace: svc_ns.clone(),
                                 target_port: TargetPort::Number(svc_port),
-                                tls: false,
+                                tls: svc_tls,
                             },
                         );
                     }
@@ -515,7 +527,8 @@ async fn proxy_upgrade(
         };
         let tls_config = make_tls_config();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-        let server_name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .unwrap_or_else(|_| rustls::pki_types::ServerName::IpAddress(addr.ip().into()));
         match connector.connect(server_name, tcp).await {
             Ok(tls_stream) => ws_handshake_and_tunnel(req, host, &path, tls_incoming, tls_stream).await,
             Err(e) => { warn!("upstream TLS failed: {e}"); bad_gw("upstream TLS error\n") }
@@ -577,12 +590,12 @@ async fn proxy_request(
         }
     };
 
-    let scheme = if backend_ref.tls { "https" } else { "http" };
-    let uri = format!(
-        "{scheme}://{}{}",
-        addr,
-        req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/")
-    );
+    let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let uri = if backend_ref.tls {
+        path.to_string()
+    } else {
+        format!("http://{addr}{path}")
+    };
 
     let mut proxy_req = Request::builder()
         .method(req.method())
@@ -614,22 +627,67 @@ async fn proxy_request(
     let proxy_req = proxy_req.body(Full::new(body)).unwrap();
 
     let result = if backend_ref.tls {
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(make_tls_config())
-            .https_or_http()
-            .enable_http1()
-            .build();
-        let client_https = hyper_util::client::legacy::Client::builder(
-            hyper_util::rt::TokioExecutor::new(),
-        )
-        .build(https);
-        client_https.request(proxy_req).await
+        let tcp = match tokio::net::TcpStream::connect(addr).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("upstream connect failed: {e}");
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Full::new(Bytes::from(format!("proxy error: connect failed\n"))))
+                    .unwrap());
+            }
+        };
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(make_tls_config()));
+        let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+            .unwrap_or_else(|_| rustls::pki_types::ServerName::IpAddress(addr.ip().into()));
+        let tls_stream = match connector.connect(server_name, tcp).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("upstream TLS failed: {e}");
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Full::new(Bytes::from(format!("proxy error: TLS failed\n"))))
+                    .unwrap());
+            }
+        };
+        let io = hyper_util::rt::TokioIo::new(tls_stream);
+        let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("upstream HTTP handshake failed: {e}");
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Full::new(Bytes::from(format!("proxy error: handshake failed\n"))))
+                    .unwrap());
+            }
+        };
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let sni_host = host.clone();
+        info!(
+            host,
+            %addr,
+            sni = %sni_host,
+            method = %proxy_req.method(),
+            uri = %proxy_req.uri(),
+            host_header = ?proxy_req.headers().get("host").map(|v| v.to_str().unwrap_or("?")),
+            x_fwd_proto = ?proxy_req.headers().get("x-forwarded-proto").map(|v| v.to_str().unwrap_or("?")),
+            "TLS upstream request"
+        );
+        match sender.send_request(proxy_req).await {
+            Ok(resp) => Ok(resp.map(|b| b.map_err(|e| std::io::Error::other(e)).boxed())),
+            Err(e) => Err(e.to_string()),
+        }
     } else {
         let client_http = hyper_util::client::legacy::Client::builder(
             hyper_util::rt::TokioExecutor::new(),
         )
         .build_http();
-        client_http.request(proxy_req).await
+        match client_http.request(proxy_req).await {
+            Ok(resp) => Ok(resp.map(|b| b.map_err(|e| std::io::Error::other(e)).boxed())),
+            Err(e) => Err(e.to_string()),
+        }
     };
 
     match result {
