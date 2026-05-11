@@ -20,47 +20,50 @@ graph TB
         subgraph sim ["ocp-sim (DaemonSet)"]
             proxy["Reverse Proxy<br/><i>*.apps.ocp-sim.test</i>"]
             routectrl["Route Controller"]
-            gwctrl["Gateway Controller<br/><i>Envoy xDS generation</i>"]
             oauthctrl["OAuth Server"]
             projectctrl["Project Controller"]
             serviceca["Service CA"]
             sccwebhook["SCC Webhook<br/><i>MutatingAdmission</i>"]
             jobsetctrl["JobSet Controller"]
             isctrl["ImageStream Controller"]
+            lbctrl["LoadBalancer Controller"]
         end
 
-        subgraph gw ["Gateway (Envoy)"]
-            envoy["Envoy"]
-            kubeauth["kube-auth-proxy"]
+        subgraph istiostack ["Istio + Kuadrant"]
+            istiod["istiod<br/><i>rev: openshift-gateway</i>"]
+            istiogw["Istio Gateway<br/><i>Envoy</i>"]
+            authorino["Authorino"]
+            limitador["Limitador"]
         end
 
         subgraph workloads ["Operator Workloads"]
             odhop["opendatahub-operator"]
             dashboard["ODH Dashboard<br/><i>+ kube-rbac-proxy sidecar</i>"]
             notebook["Workbench Pod<br/><i>Jupyter + kube-rbac-proxy</i>"]
+            maas["MaaS API + Controller"]
         end
 
         crds[("OpenShift CRDs<br/>+ seed resources")]
 
         routectrl -->|"watch Routes<br/>stamp .status"| apiserver
-        gwctrl -->|"write xDS config"| envoy
-        gwctrl -->|"watch HTTPRoutes"| apiserver
         projectctrl -->|"mirror Namespaces<br/>→ Projects"| apiserver
         serviceca -->|"inject TLS certs"| apiserver
         sccwebhook -->|"mutate pods<br/>inject fsGroup"| apiserver
         jobsetctrl -->|"watch JobSets<br/>create child Jobs"| apiserver
         isctrl -->|"watch ImageStreams<br/>populate status.tags"| apiserver
-        oauthctrl -->|"issue JWTs"| kubeauth
+        lbctrl -->|"assign IPs to<br/>LB Services"| apiserver
 
         odhop -->|"reconcile CRs"| ocpshim
+        istiod -->|"configure"| istiogw
+        authorino -->|"ext_authz"| istiogw
 
-        envoy -->|"ext_authz"| kubeauth
-        envoy -->|"route traffic"| dashboard
-        envoy -->|"route traffic"| notebook
+        istiogw -->|"route traffic"| dashboard
+        istiogw -->|"route traffic"| notebook
+        istiogw -->|"route traffic"| maas
     end
 
     browser -->|":443"| proxy
-    proxy --> envoy
+    proxy --> istiogw
     browser -->|"OAuth login"| oauthctrl
 ```
 
@@ -71,7 +74,8 @@ around for day-to-day development. Most RHOAI/ODH operator code only touches a
 handful of OpenShift-specific APIs. picoshift stubs those APIs with CRDs on a
 plain kind cluster and runs a small Rust binary (`ocp-sim`) that handles the
 dynamic parts: Route admission, Gateway API / Envoy xDS, OAuth flow, TLS
-certificate injection, and Namespace → Project mirroring.
+certificate injection, LoadBalancer IP assignment, and Namespace → Project
+mirroring.
 
 ## What's in the box
 
@@ -82,18 +86,21 @@ certificate injection, and Namespace → Project mirroring.
 | **OpenShift CRDs** | Routes, Projects, SCCs, ClusterVersion, OLM types, Gateway API, JobSet, and more |
 | **Seed resources** | ClusterVersion, Infrastructure, Ingress, Authentication, default SCCs, JobSet operator — everything operators probe at startup |
 | **ocp-sim** | Rust controller (kube-rs) running as a DaemonSet with `hostNetwork: true` |
+| **Istio** | Service mesh with `openshift-gateway` revision — provides Gateway API data plane (Envoy) |
+| **Kuadrant** | Authorino (ext_authz) + Limitador for gateway auth and rate limiting |
+| **cert-manager** | TLS certificate management for gateway listeners |
 
 ### ocp-sim controllers
 
 - **Route** — watches `route.openshift.io/v1` Routes, stamps `.status.ingress` with the admitted hostname
-- **Gateway** — reconciles Gateway API resources, generates Envoy xDS (LDS/RDS/CDS), manages oauth2-proxy and kube-rbac-proxy sidecars
 - **OAuth** — serves `/oauth/authorize` and `/oauth/token` endpoints backed by static users, issues JWTs
 - **Project** — mirrors every Namespace as a `project.openshift.io/v1` Project
 - **Service CA** — injects TLS certificates into annotated Services and their corresponding Secrets
 - **SCC Webhook** — mutating admission webhook that injects `fsGroup` into pods with `runAsNonRoot: true`, mimicking OCP's restricted SCC; also annotates namespaces with UID ranges
 - **JobSet** — partial mock of the `jobset.x-k8s.io/v1alpha2` controller; creates real `batch/v1` child Jobs from `spec.replicatedJobs` and tracks completion status
 - **ImageStream** — watches `image.openshift.io/v1` ImageStreams and populates `status.tags` from `spec.tags`, resolving `dockerImageReference` so the ODH Dashboard and notebook webhook can look up workbench images
-- **Proxy** — reverse proxy for Route hostnames (resolves `*.apps.ocp-sim.test` to the right backend Service); supports WebSocket upgrade tunneling for Jupyter kernel connections
+- **LoadBalancer** — assigns node IPs to Services of type LoadBalancer, replacing the need for MetalLB on kind
+- **Proxy** — reverse proxy for Route and HTTPRoute hostnames (resolves `*.apps.ocp-sim.test` to the right backend Service); supports WebSocket upgrade tunneling for Jupyter kernel connections
 
 ## Requirements
 
@@ -102,6 +109,8 @@ certificate injection, and Namespace → Project mirroring.
 - Go 1.26+
 - Rust toolchain (for building the simulator image)
 - `kubectl`
+- `helm` (for cert-manager and Kuadrant)
+- `istioctl` (for Istio installation)
 
 ## Quick start
 
@@ -110,31 +119,28 @@ certificate injection, and Namespace → Project mirroring.
 # (kind fork, opendatahub-operator, odh-dashboard)
 
 # Build everything and bring up the cluster
-sudo make all
+make all
 
-# Deploy the ODH operator into the cluster
-make operator-deploy
+# Install the gateway stack (Istio + cert-manager + Kuadrant)
+make gateway-stack
 
-# Create DSCI + DSC to trigger reconciliation
-make dsci
-make dsc
-
-# Patch gateway for self-signed TLS
-make patch-gatewayconfig-tls
-
-# Set up admin RBAC (required for dashboard project listing)
-make setup-admin-rbac
+# Build and deploy the ODH operator (includes DSCI, DSC, RBAC)
+make operator-install
 
 # Create a test workbench
 make workbench
 
 # Open the dashboard
 # https://rh-ai.apps.ocp-sim.test/
+
+# Optional: enable Models-as-a-Service
+make deploy-maas
+make dsc-enable-maas
 ```
 
-`make all` runs the full pipeline: builds the kind fork (with ocp-shim), the
-node image, the simulator container, creates the cluster, installs CRDs and
-seed resources, loads the simulator, and installs ODH operator CRDs.
+`make all` builds the kind fork (with ocp-shim), the node image, the simulator
+container, creates the cluster, installs CRDs and seed resources, and deploys
+the simulator. Run `make help` for a full list of targets.
 
 ### Iterating
 
@@ -171,15 +177,16 @@ picoshift/
 ├── simulator/            # Rust project — the ocp-sim binary
 │   └── src/
 │       ├── main.rs
-│       ├── route.rs       # Route admission controller
-│       ├── gateway.rs     # Gateway API → Envoy xDS
-│       ├── oauth.rs       # OAuth2 token server
-│       ├── project.rs     # Namespace → Project sync
-│       ├── service_ca.rs  # Service CA certificate injection
-│       ├── pod_mutate.rs  # SCC-like mutating webhook + namespace UID ranges
-│       ├── jobset.rs      # JobSet mock controller
-│       ├── imagestream.rs # ImageStream import controller
-│       └── proxy.rs       # Reverse proxy for Route traffic
+│       ├── route.rs         # Route admission controller
+│       ├── gateway.rs       # Gateway API → Envoy xDS (built-in, optional)
+│       ├── oauth.rs         # OAuth2 token server
+│       ├── project.rs       # Namespace → Project sync
+│       ├── service_ca.rs    # Service CA certificate injection
+│       ├── pod_mutate.rs    # SCC-like mutating webhook + namespace UID ranges
+│       ├── jobset.rs        # JobSet mock controller
+│       ├── imagestream.rs   # ImageStream import controller
+│       ├── loadbalancer.rs  # LoadBalancer IP assignment for kind
+│       └── proxy.rs         # Reverse proxy for Route + HTTPRoute traffic
 ├── deploy/               # Kubernetes manifests for the simulator
 ├── scripts/              # Python/bash helper scripts
 │   ├── create-workbench.py        # Create a project + workbench (replicates dashboard flow)
@@ -208,13 +215,17 @@ ocp-shim, the opendatahub-operator source, and optionally the ODH Dashboard.
    default SCCs).
 
 3. **ocp-sim** deploys as a DaemonSet on the control plane node. Its
-   controllers watch for Routes, Gateways, Namespaces, ImageStreams, and
+   controllers watch for Routes, Namespaces, ImageStreams, Services, and
    JobSets, providing the dynamic behavior that operators depend on: Route
-   admission, Envoy configuration, TLS certificates, Project objects,
-   ImageStream status resolution, SCC-like pod mutation (fsGroup injection),
+   admission, TLS certificates, Project objects, ImageStream status resolution,
+   SCC-like pod mutation (fsGroup injection), LoadBalancer IP assignment,
    and JobSet child Job management.
 
-4. With the simulated control plane in place, the ODH operator starts, detects
+4. **Istio + Kuadrant** provide the real Gateway API data plane. Istio runs
+   with the `openshift-gateway` revision so it matches what OSSM/Sail does on
+   real OpenShift. Kuadrant provides Authorino (ext_authz) and Limitador.
+
+5. With the simulated control plane in place, the ODH operator starts, detects
    "OpenShift", and reconciles normally. The Dashboard gets a working Gateway
    with OAuth, WebSocket support, and TLS — enough to develop and test against
    without a real OCP cluster.
@@ -226,14 +237,19 @@ Once fully deployed, the cluster runs the following workloads:
 | Namespace | Component | Description |
 |-----------|-----------|-------------|
 | `ocp-sim` | ocp-sim DaemonSet | All simulated OCP controllers + reverse proxy |
-| `openshift-ingress` | data-science-gateway (Envoy) | Gateway API data plane, TLS termination |
-| `openshift-ingress` | kube-auth-proxy | OAuth2 ext_authz filter for Envoy |
+| `istio-system` | istiod (openshift-gateway) | Istio control plane, manages Envoy gateways |
+| `cert-manager` | cert-manager | TLS certificate lifecycle management |
+| `kuadrant-system` | Kuadrant operator | Authorino (ext_authz) + Limitador |
+| `openshift-ingress` | data-science-gateway (Envoy) | Istio-managed gateway, TLS termination |
+| `openshift-ingress` | kube-auth-proxy | OAuth2 ext_authz filter for gateway |
 | `opendatahub-operator-system` | ODH operator | Reconciles DSC/DSCI into component deployments |
 | `opendatahub` | odh-dashboard (×2) | Dashboard UI (9 sidecar containers per pod) |
 | `opendatahub` | notebook-controller | Upstream Kubeflow notebook controller |
 | `opendatahub` | odh-notebook-controller | ODH notebook controller (webhook, RBAC, HTTPRoute) |
 | `opendatahub` | kserve, kuberay, feast, trustyai, etc. | Model serving and ML platform operators |
 | `opendatahub` | data-science-pipelines-operator | Pipeline orchestration |
+| `opendatahub` | maas-api, maas-controller | Models-as-a-Service (optional, via `make deploy-maas`) |
+| `opendatahub` | maas-postgres | MaaS backing database (optional) |
 | `odh-model-registries` | model-catalog + postgres | Model registry with backing database |
 | `project1` | workbench1 (StatefulSet) | Jupyter notebook + kube-rbac-proxy sidecar |
 
