@@ -8,7 +8,7 @@ single laptop with ~200 MB of RAM.
 
 ```mermaid
 graph TB
-    browser["Browser"]
+    browser["Browser / oc CLI"]
 
     subgraph kind ["kind cluster (single node)"]
         subgraph shim ["ocp-shim"]
@@ -20,7 +20,7 @@ graph TB
         subgraph sim ["ocp-sim (DaemonSet)"]
             proxy["Reverse Proxy<br/><i>*.apps.ocp-sim.test</i>"]
             routectrl["Route Controller"]
-            oauthctrl["OAuth Server"]
+            oauthctrl["OAuth Server<br/><i>login form + users.yaml</i>"]
             projectctrl["Project Controller"]
             serviceca["Service CA"]
             sccwebhook["SCC Webhook<br/><i>MutatingAdmission</i>"]
@@ -29,9 +29,13 @@ graph TB
             lbctrl["LoadBalancer Controller"]
         end
 
+        subgraph gateway ["Gateway (openshift-ingress)"]
+            istiogw["Istio Gateway<br/><i>Envoy + EnvoyFilter</i>"]
+            kubeauthproxy["kube-auth-proxy<br/><i>oauth2-proxy</i>"]
+        end
+
         subgraph istiostack ["Istio + Kuadrant"]
             istiod["istiod<br/><i>rev: openshift-gateway</i>"]
-            istiogw["Istio Gateway<br/><i>Envoy</i>"]
             authorino["Authorino"]
             limitador["Limitador"]
         end
@@ -55,7 +59,8 @@ graph TB
 
         odhop -->|"reconcile CRs"| ocpshim
         istiod -->|"configure"| istiogw
-        authorino -->|"ext_authz"| istiogw
+        istiogw -->|"ext_authz<br/>check session"| kubeauthproxy
+        kubeauthproxy -.->|"OAuth redirect<br/>(via browser)"| oauthctrl
 
         istiogw -->|"route traffic"| dashboard
         istiogw -->|"route traffic"| notebook
@@ -63,8 +68,8 @@ graph TB
     end
 
     browser -->|":443"| proxy
-    proxy --> istiogw
-    browser -->|"OAuth login form<br/>+ oc login Basic Auth"| oauthctrl
+    proxy -->|"rh-ai.*"| istiogw
+    proxy -->|"oauth-openshift.*"| oauthctrl
 ```
 
 ## Why
@@ -87,7 +92,8 @@ mirroring.
 | **Seed resources** | ClusterVersion, Infrastructure, Ingress, Authentication, default SCCs, JobSet operator — everything operators probe at startup |
 | **ocp-sim** | Rust controller (kube-rs) running as a DaemonSet with `hostNetwork: true` |
 | **Istio** | Service mesh with `openshift-gateway` revision — provides Gateway API data plane (Envoy) |
-| **Kuadrant** | Authorino (ext_authz) + Limitador for gateway auth and rate limiting |
+| **kube-auth-proxy** | oauth2-proxy deployment in `openshift-ingress` — manages browser sessions, wired into Envoy via ext_authz EnvoyFilter, redirects unauthenticated users to the OAuth server |
+| **Kuadrant** | Authorino + Limitador for gateway auth policies and rate limiting |
 | **cert-manager** | TLS certificate management for gateway listeners |
 
 ### ocp-sim controllers
@@ -227,9 +233,18 @@ ocp-shim, the opendatahub-operator source, and optionally the ODH Dashboard.
 
 4. **Istio + Kuadrant** provide the real Gateway API data plane. Istio runs
    with the `openshift-gateway` revision so it matches what OSSM/Sail does on
-   real OpenShift. Kuadrant provides Authorino (ext_authz) and Limitador.
+   real OpenShift. Kuadrant provides Authorino and Limitador for auth policies
+   and rate limiting.
 
-5. With the simulated control plane in place, the ODH operator starts, detects
+5. **kube-auth-proxy** (oauth2-proxy) sits alongside the Envoy gateway in
+   `openshift-ingress`. An EnvoyFilter wires Envoy's ext_authz to
+   kube-auth-proxy, which checks browser sessions. Unauthenticated requests
+   get redirected to the **ocp-sim OAuth server**, which presents a login form
+   (or responds to `oc login` Basic Auth challenges). After login, the OAuth
+   server creates `User` and `Identity` API objects and issues an auth code
+   that kube-auth-proxy exchanges for a token and stores in a session cookie.
+
+6. With the simulated control plane in place, the ODH operator starts, detects
    "OpenShift", and reconciles normally. The Dashboard gets a working Gateway
    with OAuth, WebSocket support, and TLS — enough to develop and test against
    without a real OCP cluster.
@@ -243,9 +258,9 @@ Once fully deployed, the cluster runs the following workloads:
 | `ocp-sim` | ocp-sim DaemonSet | All simulated OCP controllers + reverse proxy |
 | `istio-system` | istiod (openshift-gateway) | Istio control plane, manages Envoy gateways |
 | `cert-manager` | cert-manager | TLS certificate lifecycle management |
-| `kuadrant-system` | Kuadrant operator | Authorino (ext_authz) + Limitador |
-| `openshift-ingress` | data-science-gateway (Envoy) | Istio-managed gateway, TLS termination |
-| `openshift-ingress` | kube-auth-proxy | OAuth2 ext_authz filter for gateway |
+| `kuadrant-system` | Kuadrant operator | Authorino + Limitador for auth policies and rate limiting |
+| `openshift-ingress` | data-science-gateway (Envoy) | Istio-managed gateway with ext_authz EnvoyFilter, TLS termination |
+| `openshift-ingress` | kube-auth-proxy (×2) | oauth2-proxy — manages browser sessions, redirects to OAuth server for login |
 | `opendatahub-operator-system` | ODH operator | Reconciles DSC/DSCI into component deployments |
 | `opendatahub` | odh-dashboard (×2) | Dashboard UI (9 sidecar containers per pod) |
 | `opendatahub` | notebook-controller | Upstream Kubeflow notebook controller |
