@@ -1,0 +1,20 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: identities.user.openshift.io
+spec:
+  group: user.openshift.io
+  names:
+    kind: Identity
+    listKind: IdentityList
+    plural: identities
+    singular: identity
+  scope: Cluster
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true

@@ -213,6 +213,8 @@ deploy-clusterversion:
 
 deploy-sim: sim-image sim-load
 	kubectl wait --for=condition=Ready node --all --timeout=120s
+	kubectl create namespace ocp-sim 2>/dev/null || true
+	kubectl -n ocp-sim create configmap ocp-sim-users --from-file=users.yaml --dry-run=client -o yaml | kubectl apply -f -
 	kubectl apply -f deploy/simulator.yaml
 	kubectl -n ocp-sim delete pod --all --wait=false 2>/dev/null || true
 	@sleep 3

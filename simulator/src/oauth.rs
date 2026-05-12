@@ -32,13 +32,79 @@ const OAUTH_NS: &str = "openshift-authentication";
 const CODE_TTL: Duration = Duration::from_secs(300);
 const TOKEN_TTL: Duration = Duration::from_secs(86400);
 
+// ---------------------------------------------------------------------------
+// User store
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct UserEntry {
+    pub username: String,
+    pub password: String,
+    pub email: Option<String>,
+    pub groups: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UsersConfig {
+    users: Vec<UserEntry>,
+}
+
+pub struct UserStore {
+    users: Vec<UserEntry>,
+}
+
+impl UserStore {
+    pub fn load(path: Option<&str>) -> Self {
+        if let Some(p) = path {
+            match std::fs::read_to_string(p) {
+                Ok(contents) => match serde_yaml::from_str::<UsersConfig>(&contents) {
+                    Ok(config) => {
+                        info!(path = p, count = config.users.len(), "loaded users file");
+                        return Self { users: config.users };
+                    }
+                    Err(e) => warn!(path = p, %e, "failed to parse users file, using default"),
+                },
+                Err(e) => warn!(path = p, %e, "failed to read users file, using default"),
+            }
+        }
+        info!("using default user: admin/admin");
+        Self {
+            users: vec![UserEntry {
+                username: "admin".into(),
+                password: "admin".into(),
+                email: Some("admin@ocp-sim.test".into()),
+                groups: Some(vec![
+                    "system:cluster-admins".into(),
+                    "system:authenticated".into(),
+                ]),
+            }],
+        }
+    }
+
+    fn authenticate(&self, username: &str, password: &str) -> Option<&UserEntry> {
+        self.users
+            .iter()
+            .find(|u| u.username == username && u.password == password)
+    }
+
+    fn get(&self, username: &str) -> Option<&UserEntry> {
+        self.users.iter().find(|u| u.username == username)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OAuth state
+// ---------------------------------------------------------------------------
+
 struct AuthCode {
+    username: String,
     client_id: String,
     _redirect_uri: String,
     created: Instant,
 }
 
 struct TokenInfo {
+    username: String,
     _client_id: String,
     created: Instant,
 }
@@ -46,16 +112,22 @@ struct TokenInfo {
 struct OAuthState {
     codes: RwLock<HashMap<String, AuthCode>>,
     tokens: RwLock<HashMap<String, TokenInfo>>,
+    user_store: Arc<UserStore>,
 }
 
 impl OAuthState {
-    fn new() -> Self {
+    fn new(user_store: Arc<UserStore>) -> Self {
         Self {
             codes: RwLock::new(HashMap::new()),
             tokens: RwLock::new(HashMap::new()),
+            user_store,
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn generate_random_string(len: usize) -> String {
     use rand::distributions::Alphanumeric;
@@ -95,6 +167,14 @@ fn text_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
+fn html_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Full::new(Bytes::from(body.to_string())))
+        .unwrap()
+}
+
 fn parse_query(uri: &hyper::Uri) -> HashMap<String, String> {
     uri.query()
         .map(|q| {
@@ -110,6 +190,81 @@ fn parse_form_body(body: &[u8]) -> HashMap<String, String> {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
 }
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+// ---------------------------------------------------------------------------
+// Login form HTML
+// ---------------------------------------------------------------------------
+
+fn login_form_html(
+    client_id: &str,
+    redirect_uri: &str,
+    state: &str,
+    response_type: &str,
+    error: bool,
+) -> String {
+    let error_block = if error {
+        r#"<div style="background:#c9190b;color:#fff;padding:8px 12px;border-radius:4px;margin-bottom:16px;font-size:14px">Invalid username or password. Please try again.</div>"#
+    } else {
+        ""
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log in to ocp-sim</title>
+<style>
+  body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         background:#151515; color:#e0e0e0; display:flex; align-items:center; justify-content:center; min-height:100vh; }}
+  .card {{ background:#1e1e1e; border:1px solid #333; border-radius:8px; padding:32px; width:340px; }}
+  h1 {{ font-size:20px; margin:0 0 24px; text-align:center; }}
+  label {{ display:block; font-size:13px; margin-bottom:4px; }}
+  input[type=text], input[type=password] {{ width:100%; padding:8px; margin-bottom:16px;
+         border:1px solid #555; border-radius:4px; background:#2a2a2a; color:#e0e0e0;
+         font-size:14px; box-sizing:border-box; }}
+  button {{ width:100%; padding:10px; background:#0066cc; color:#fff; border:none;
+           border-radius:4px; font-size:14px; cursor:pointer; }}
+  button:hover {{ background:#004c99; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Log in to ocp-sim</h1>
+  {error_block}
+  <form method="POST" action="/oauth/authorize">
+    <input type="hidden" name="client_id" value="{client_id_escaped}">
+    <input type="hidden" name="redirect_uri" value="{redirect_uri_escaped}">
+    <input type="hidden" name="state" value="{state_escaped}">
+    <input type="hidden" name="response_type" value="{response_type_escaped}">
+    <label for="username">Username</label>
+    <input type="text" id="username" name="username" autocomplete="username" autofocus>
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" autocomplete="current-password">
+    <button type="submit">Log in</button>
+  </form>
+</div>
+</body>
+</html>"#,
+        error_block = error_block,
+        client_id_escaped = html_escape(client_id),
+        redirect_uri_escaped = html_escape(redirect_uri),
+        state_escaped = html_escape(state),
+        response_type_escaped = html_escape(response_type),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// OAuthClient validation
+// ---------------------------------------------------------------------------
 
 fn oauth_client_api_resource() -> ApiResource {
     ApiResource {
@@ -150,7 +305,131 @@ async fn validate_client(
     Some((secret, redirect_uris))
 }
 
-async fn handle_authorize(
+// ---------------------------------------------------------------------------
+// User + Identity API object creation
+// ---------------------------------------------------------------------------
+
+fn user_api_resource() -> ApiResource {
+    ApiResource {
+        group: "user.openshift.io".into(),
+        version: "v1".into(),
+        api_version: "user.openshift.io/v1".into(),
+        kind: "User".into(),
+        plural: "users".into(),
+    }
+}
+
+fn identity_api_resource() -> ApiResource {
+    ApiResource {
+        group: "user.openshift.io".into(),
+        version: "v1".into(),
+        api_version: "user.openshift.io/v1".into(),
+        kind: "Identity".into(),
+        plural: "identities".into(),
+    }
+}
+
+async fn ensure_user_and_identity(client: &Client, username: &str) {
+    let identity_name = format!("ocp-sim:{username}");
+
+    let user_ar = user_api_resource();
+    let users: Api<DynamicObject> = Api::all_with(client.clone(), &user_ar);
+    let user_obj = serde_json::json!({
+        "apiVersion": "user.openshift.io/v1",
+        "kind": "User",
+        "metadata": {
+            "name": username,
+        },
+        "fullName": username,
+        "identities": [&identity_name],
+    });
+    match users
+        .patch(
+            username,
+            &PatchParams::apply("ocp-sim-oauth"),
+            &Patch::Apply(serde_json::from_value::<DynamicObject>(user_obj).unwrap()),
+        )
+        .await
+    {
+        Ok(u) => {
+            let uid = u.metadata.uid.as_deref().unwrap_or("unknown");
+            info!(username, uid, "ensured User object");
+
+            let id_ar = identity_api_resource();
+            let identities: Api<DynamicObject> = Api::all_with(client.clone(), &id_ar);
+            let id_obj = serde_json::json!({
+                "apiVersion": "user.openshift.io/v1",
+                "kind": "Identity",
+                "metadata": {
+                    "name": &identity_name,
+                },
+                "providerName": "ocp-sim",
+                "providerUserName": username,
+                "user": {
+                    "name": username,
+                    "uid": uid,
+                },
+            });
+            match identities
+                .patch(
+                    &identity_name,
+                    &PatchParams::apply("ocp-sim-oauth"),
+                    &Patch::Apply(serde_json::from_value::<DynamicObject>(id_obj).unwrap()),
+                )
+                .await
+            {
+                Ok(_) => info!(identity_name, "ensured Identity object"),
+                Err(e) => warn!(identity_name, %e, "failed to create Identity"),
+            }
+        }
+        Err(e) => warn!(username, %e, "failed to create User"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Authorization code issuance (shared by form POST and Basic Auth)
+// ---------------------------------------------------------------------------
+
+async fn issue_auth_code(
+    state: &OAuthState,
+    username: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    req_state: &str,
+) -> Response<Full<Bytes>> {
+    let code = generate_random_string(32);
+    state.codes.write().await.insert(
+        code.clone(),
+        AuthCode {
+            username: username.to_string(),
+            client_id: client_id.to_string(),
+            _redirect_uri: redirect_uri.to_string(),
+            created: Instant::now(),
+        },
+    );
+
+    let mut redirect = Url::parse(redirect_uri).unwrap_or_else(|_| {
+        Url::parse("http://localhost/error").unwrap()
+    });
+    redirect.query_pairs_mut().append_pair("code", &code);
+    if !req_state.is_empty() {
+        redirect.query_pairs_mut().append_pair("state", req_state);
+    }
+
+    info!(redirect = %redirect, username, "authorize: issuing code, redirecting");
+
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header("location", redirect.as_str())
+        .body(Full::new(Bytes::new()))
+        .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+async fn handle_authorize_get(
     client: &Client,
     state: &OAuthState,
     req: &Request<Incoming>,
@@ -166,6 +445,7 @@ async fn handle_authorize(
         None => return text_response(StatusCode::BAD_REQUEST, "missing redirect_uri\n"),
     };
     let req_state = params.get("state").cloned().unwrap_or_default();
+    let response_type = params.get("response_type").cloned().unwrap_or_default();
 
     let (_, redirect_uris) = match validate_client(client, &client_id).await {
         Some(c) => c,
@@ -179,31 +459,86 @@ async fn handle_authorize(
         return text_response(StatusCode::BAD_REQUEST, "redirect_uri mismatch\n");
     }
 
-    let code = generate_random_string(32);
-    state.codes.write().await.insert(
-        code.clone(),
-        AuthCode {
-            client_id,
-            _redirect_uri: redirect_uri.clone(),
-            created: Instant::now(),
-        },
-    );
-
-    let mut redirect = Url::parse(&redirect_uri).unwrap_or_else(|_| {
-        Url::parse("http://localhost/error").unwrap()
-    });
-    redirect.query_pairs_mut().append_pair("code", &code);
-    if !req_state.is_empty() {
-        redirect.query_pairs_mut().append_pair("state", &req_state);
+    // Basic Auth challenge path (oc login)
+    if let Some(auth) = req.headers().get("authorization").and_then(|h| h.to_str().ok()) {
+        if let Some(encoded) = auth.strip_prefix("Basic ") {
+            if let Ok(decoded) = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                encoded.trim(),
+            ) {
+                if let Ok(cred_str) = std::str::from_utf8(&decoded) {
+                    if let Some((user, pass)) = cred_str.split_once(':') {
+                        if let Some(_entry) = state.user_store.authenticate(user, pass) {
+                            ensure_user_and_identity(client, user).await;
+                            return issue_auth_code(state, user, &client_id, &redirect_uri, &req_state).await;
+                        }
+                    }
+                }
+            }
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("www-authenticate", "Basic realm=\"openshift\"")
+                .body(Full::new(Bytes::from("invalid credentials\n")))
+                .unwrap();
+        }
     }
 
-    info!(redirect = %redirect, "authorize: issuing code, redirecting");
+    // If client sends X-CSRF-Token (oc login probing), respond with 401 challenge
+    if req.headers().contains_key("x-csrf-token") {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("www-authenticate", "Basic realm=\"openshift\"")
+            .body(Full::new(Bytes::from("challenge\n")))
+            .unwrap();
+    }
 
-    Response::builder()
-        .status(StatusCode::FOUND)
-        .header("location", redirect.as_str())
-        .body(Full::new(Bytes::new()))
-        .unwrap()
+    // Browser flow: show login form
+    let show_error = params.get("error").is_some();
+    let html = login_form_html(&client_id, &redirect_uri, &req_state, &response_type, show_error);
+    html_response(StatusCode::OK, &html)
+}
+
+async fn handle_authorize_post(
+    client: &Client,
+    state: &OAuthState,
+    body: &[u8],
+) -> Response<Full<Bytes>> {
+    let params = parse_form_body(body);
+
+    let client_id = match params.get("client_id") {
+        Some(id) => id.clone(),
+        None => return text_response(StatusCode::BAD_REQUEST, "missing client_id\n"),
+    };
+    let redirect_uri = match params.get("redirect_uri") {
+        Some(uri) => uri.clone(),
+        None => return text_response(StatusCode::BAD_REQUEST, "missing redirect_uri\n"),
+    };
+    let req_state = params.get("state").cloned().unwrap_or_default();
+    let response_type = params.get("response_type").cloned().unwrap_or_default();
+    let username = params.get("username").cloned().unwrap_or_default();
+    let password = params.get("password").cloned().unwrap_or_default();
+
+    if username.is_empty()
+        || state.user_store.authenticate(&username, &password).is_none()
+    {
+        let html = login_form_html(&client_id, &redirect_uri, &req_state, &response_type, true);
+        return html_response(StatusCode::OK, &html);
+    }
+
+    // Validate client
+    let (_, redirect_uris) = match validate_client(client, &client_id).await {
+        Some(c) => c,
+        None => return text_response(StatusCode::BAD_REQUEST, "unknown client_id\n"),
+    };
+    let uri_matches = redirect_uris
+        .iter()
+        .any(|u| redirect_uri.starts_with(u));
+    if !uri_matches {
+        return text_response(StatusCode::BAD_REQUEST, "redirect_uri mismatch\n");
+    }
+
+    ensure_user_and_identity(client, &username).await;
+    issue_auth_code(state, &username, &client_id, &redirect_uri, &req_state).await
 }
 
 async fn handle_token(
@@ -271,12 +606,13 @@ async fn handle_token(
     state.tokens.write().await.insert(
         token.clone(),
         TokenInfo {
+            username: auth_code.username.clone(),
             _client_id: client_id,
             created: Instant::now(),
         },
     );
 
-    info!("token: issued access_token");
+    info!(username = %auth_code.username, "token: issued access_token");
 
     json_response(
         StatusCode::OK,
@@ -303,24 +639,48 @@ async fn handle_userinfo(state: &OAuthState, req: &Request<Incoming>) -> Respons
     };
 
     let tokens = state.tokens.read().await;
-    match tokens.get(&token) {
-        Some(info) if info.created.elapsed() < TOKEN_TTL => {}
+    let token_info = match tokens.get(&token) {
+        Some(info) if info.created.elapsed() < TOKEN_TTL => info,
         _ => {
             return json_response(StatusCode::UNAUTHORIZED, r#"{"error":"invalid_token"}"#);
         }
-    }
+    };
+
+    let username = &token_info.username;
+    let (email, groups) = match state.user_store.get(username) {
+        Some(entry) => {
+            let email = entry
+                .email
+                .clone()
+                .unwrap_or_else(|| format!("{username}@ocp-sim.test"));
+            let groups = entry
+                .groups
+                .clone()
+                .unwrap_or_else(|| vec!["system:authenticated".into()]);
+            (email, groups)
+        }
+        None => (
+            format!("{username}@ocp-sim.test"),
+            vec!["system:authenticated".into()],
+        ),
+    };
 
     json_response(
         StatusCode::OK,
         &serde_json::json!({
-            "sub": "admin",
-            "name": "admin",
-            "preferred_username": "admin",
-            "email": "admin@ocp-sim.test"
+            "sub": username,
+            "name": username,
+            "preferred_username": username,
+            "email": email,
+            "groups": groups,
         })
         .to_string(),
     )
 }
+
+// ---------------------------------------------------------------------------
+// Request router
+// ---------------------------------------------------------------------------
 
 async fn handle_request(
     client: Client,
@@ -335,7 +695,12 @@ async fn handle_request(
             Ok(json_response(StatusCode::OK, &discovery_json()))
         }
         (Method::GET, "/oauth/authorize") => {
-            Ok(handle_authorize(&client, &state, &req).await)
+            Ok(handle_authorize_get(&client, &state, &req).await)
+        }
+        (Method::POST, "/oauth/authorize") => {
+            use http_body_util::BodyExt;
+            let body = req.collect().await?.to_bytes();
+            Ok(handle_authorize_post(&client, &state, &body).await)
         }
         (Method::POST, "/oauth/token") => {
             use http_body_util::BodyExt;
@@ -348,6 +713,10 @@ async fn handle_request(
         _ => Ok(text_response(StatusCode::NOT_FOUND, "not found\n")),
     }
 }
+
+// ---------------------------------------------------------------------------
+// TLS + infrastructure setup
+// ---------------------------------------------------------------------------
 
 fn generate_tls_config(ca: &CaState) -> Result<ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
     let cn = format!("{OAUTH_HOST}.{DOMAIN}");
@@ -584,7 +953,11 @@ async fn patch_coredns(client: &Client, node_ip: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn run(client: Client, ca: Arc<CaState>) -> anyhow::Result<()> {
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+pub async fn run(client: Client, ca: Arc<CaState>, user_store: Arc<UserStore>) -> anyhow::Result<()> {
     let tls_config = generate_tls_config(&ca)
         .map_err(|e| anyhow::anyhow!("failed to generate TLS config: {e}"))?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
@@ -593,7 +966,7 @@ pub async fn run(client: Client, ca: Arc<CaState>) -> anyhow::Result<()> {
         warn!(%e, "failed to set up OAuth infrastructure (will retry on next restart)");
     }
 
-    let state = Arc::new(OAuthState::new());
+    let state = Arc::new(OAuthState::new(user_store));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], OAUTH_PORT));
     let listener = TcpListener::bind(addr).await?;

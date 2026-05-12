@@ -23,6 +23,9 @@ struct Args {
 
     #[arg(long, default_value_t = 80, help = "Port for the reverse proxy")]
     proxy_port: u16,
+
+    #[arg(long, help = "Path to users.yaml for OAuth user definitions")]
+    users_file: Option<String>,
 }
 
 pub struct CaState {
@@ -87,7 +90,8 @@ async fn main() -> anyhow::Result<()> {
         warn!("built-in gateway controller disabled (ENABLE_BUILTIN_GATEWAY=false)");
         tokio::spawn(std::future::pending())
     };
-    let oauth_handle = tokio::spawn(oauth::run(client.clone(), ca.clone()));
+    let user_store = Arc::new(oauth::UserStore::load(args.users_file.as_deref()));
+    let oauth_handle = tokio::spawn(oauth::run(client.clone(), ca.clone(), user_store));
     let proj_handle = tokio::spawn(project::run(client.clone()));
     let scc_handle = tokio::spawn(pod_mutate::run(client.clone(), ca.clone()));
     let jobset_handle = tokio::spawn(jobset::run(client.clone()));

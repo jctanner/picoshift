@@ -1,0 +1,20 @@
+users:
+  - username: admin
+    password: admin
+    email: admin@ocp-sim.test
+    groups:
+      - system:cluster-admins
+      - system:authenticated
+
+  - username: user1
+    password: user1
+    email: user1@ocp-sim.test
+    groups:
+      - system:authenticated
+
+  - username: developer
+    password: developer
+    email: developer@ocp-sim.test
+    groups:
+      - system:authenticated
+      - devteam
