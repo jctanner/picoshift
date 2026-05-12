@@ -71,12 +71,12 @@ graph TB
 
         istiogw -->|"route traffic"| dashboard
         istiogw -->|"route traffic"| notebook
+        dashboard -->|"maas-ui BFF<br/>API calls"| maasgwenvoy
         maasgwenvoy -->|"route traffic"| maas
     end
 
     browser -->|":443"| proxy
     proxy -->|"rh-ai.*"| istiogw
-    proxy -->|"maas.*"| maasgwenvoy
     proxy -->|"oauth-openshift.*"| oauthctrl
 ```
 
