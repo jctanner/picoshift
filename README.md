@@ -64,7 +64,7 @@ graph TB
 
     browser -->|":443"| proxy
     proxy --> istiogw
-    browser -->|"OAuth login"| oauthctrl
+    browser -->|"OAuth login form<br/>+ oc login Basic Auth"| oauthctrl
 ```
 
 ## Why
@@ -93,7 +93,7 @@ mirroring.
 ### ocp-sim controllers
 
 - **Route** — watches `route.openshift.io/v1` Routes, stamps `.status.ingress` with the admitted hostname
-- **OAuth** — serves `/oauth/authorize` and `/oauth/token` endpoints backed by static users, issues JWTs
+- **OAuth** — serves `/oauth/authorize` (login form + Basic Auth challenge for `oc login`) and `/oauth/token`; authenticates against `users.yaml`, creates `User` and `Identity` API objects on first login, and returns per-user groups via `/oauth/userinfo`
 - **Project** — mirrors every Namespace as a `project.openshift.io/v1` Project
 - **Service CA** — injects TLS certificates into annotated Services and their corresponding Secrets
 - **SCC Webhook** — mutating admission webhook that injects `fsGroup` into pods with `runAsNonRoot: true`, mimicking OCP's restricted SCC; also annotates namespaces with UID ranges
@@ -130,7 +130,10 @@ make operator-install
 # Create a test workbench
 make workbench
 
-# Open the dashboard
+# Log in via CLI (default users defined in users.yaml)
+oc login --username=admin --password=admin
+
+# Open the dashboard (browser login form)
 # https://rh-ai.apps.ocp-sim.test/
 
 # Optional: enable Models-as-a-Service
@@ -187,6 +190,7 @@ picoshift/
 │       ├── imagestream.rs   # ImageStream import controller
 │       ├── loadbalancer.rs  # LoadBalancer IP assignment for kind
 │       └── proxy.rs         # Reverse proxy for Route + HTTPRoute traffic
+├── users.yaml            # Default OAuth users (admin, user1, developer)
 ├── deploy/               # Kubernetes manifests for the simulator
 ├── scripts/              # Python/bash helper scripts
 │   ├── create-workbench.py        # Create a project + workbench (replicates dashboard flow)
