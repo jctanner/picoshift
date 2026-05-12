@@ -342,7 +342,7 @@ dsci:
 		-p '{"spec":{"verifyProviderCertificate":false}}'
 
 dsc:
-	kubectl apply -f $(ODH_DIR)/config/samples/datasciencecluster_v2_datasciencecluster.yaml
+	kubectl apply -f seed/datasciencecluster.yaml
 
 dsc-enable-maas:
 	kubectl patch datasciencecluster default-dsc --type=merge \
