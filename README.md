@@ -29,9 +29,14 @@ graph TB
             lbctrl["LoadBalancer Controller"]
         end
 
-        subgraph gateway ["Gateway (openshift-ingress)"]
-            istiogw["Istio Gateway<br/><i>Envoy + EnvoyFilter</i>"]
-            kubeauthproxy["kube-auth-proxy<br/><i>oauth2-proxy</i>"]
+        subgraph gateways ["Gateways (openshift-ingress)"]
+            subgraph dsgw ["data-science-gateway"]
+                istiogw["Envoy + EnvoyFilter"]
+                kubeauthproxy["kube-auth-proxy<br/><i>oauth2-proxy</i>"]
+            end
+            subgraph maasgw ["maas-default-gateway (optional)"]
+                maasgwenvoy["Envoy"]
+            end
         end
 
         subgraph istiostack ["Istio + Kuadrant"]
@@ -59,16 +64,19 @@ graph TB
 
         odhop -->|"reconcile CRs"| ocpshim
         istiod -->|"configure"| istiogw
+        istiod -->|"configure"| maasgwenvoy
         istiogw -->|"ext_authz<br/>check session"| kubeauthproxy
         kubeauthproxy -.->|"OAuth redirect<br/>(via browser)"| oauthctrl
+        maasgwenvoy -->|"ext_authz<br/>API key auth"| authorino
 
         istiogw -->|"route traffic"| dashboard
         istiogw -->|"route traffic"| notebook
-        istiogw -->|"route traffic"| maas
+        maasgwenvoy -->|"route traffic"| maas
     end
 
     browser -->|":443"| proxy
     proxy -->|"rh-ai.*"| istiogw
+    proxy -->|"maas.*"| maasgwenvoy
     proxy -->|"oauth-openshift.*"| oauthctrl
 ```
 
@@ -233,16 +241,20 @@ ocp-shim, the opendatahub-operator source, and optionally the ODH Dashboard.
 
 4. **Istio + Kuadrant** provide the real Gateway API data plane. Istio runs
    with the `openshift-gateway` revision so it matches what OSSM/Sail does on
-   real OpenShift. Kuadrant provides Authorino and Limitador for auth policies
-   and rate limiting.
+   real OpenShift. Two gateways live in `openshift-ingress`:
+   - **data-science-gateway** — serves the Dashboard, workbenches, and OAuth
+     callbacks (`rh-ai.apps.ocp-sim.test`). Uses **kube-auth-proxy**
+     (oauth2-proxy) for browser session auth, wired via an EnvoyFilter ext_authz.
+   - **maas-default-gateway** (optional, via `make deploy-maas`) — serves
+     model-serving API endpoints (`maas.apps.ocp-sim.test`). Uses **Authorino**
+     for API key authentication via Kuadrant AuthPolicy.
 
-5. **kube-auth-proxy** (oauth2-proxy) sits alongside the Envoy gateway in
-   `openshift-ingress`. An EnvoyFilter wires Envoy's ext_authz to
-   kube-auth-proxy, which checks browser sessions. Unauthenticated requests
-   get redirected to the **ocp-sim OAuth server**, which presents a login form
-   (or responds to `oc login` Basic Auth challenges). After login, the OAuth
-   server creates `User` and `Identity` API objects and issues an auth code
-   that kube-auth-proxy exchanges for a token and stores in a session cookie.
+5. **kube-auth-proxy** checks browser sessions on the data-science-gateway.
+   Unauthenticated requests get redirected to the **ocp-sim OAuth server**,
+   which presents a login form (or responds to `oc login` Basic Auth
+   challenges). After login, the OAuth server creates `User` and `Identity`
+   API objects and issues an auth code that kube-auth-proxy exchanges for a
+   token and stores in a session cookie.
 
 6. With the simulated control plane in place, the ODH operator starts, detects
    "OpenShift", and reconciles normally. The Dashboard gets a working Gateway
