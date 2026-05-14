@@ -6,6 +6,14 @@ BASE_IMAGE     := kindest/base:ocp-shim
 NODE_IMAGE     := localhost/kindest/node:ocp-shim
 SIM_IMAGE      := localhost/ocp-sim:latest
 
+# Auth mode: legacy (sha256~ tokens), oidc (JWT tokens), or byoidc (external OIDC)
+AUTH_MODE      ?= legacy
+
+# BYOIDC settings (only used when AUTH_MODE=byoidc)
+OIDC_ISSUER_URL    ?=
+OIDC_CLIENT_ID     ?=
+OIDC_CLIENT_SECRET ?=
+
 # Rootful podman — run `sudo make all` (or set SUDO= to disable)
 SUDO           ?= sudo
 
@@ -13,7 +21,7 @@ SUDO           ?= sudo
 # Top-level targets
 # ──────────────────────────────────────────────
 
-.PHONY: all build-all cluster deploy setup teardown status logs \
+.PHONY: all all-byoidc build-all cluster deploy setup teardown status logs \
        operator-install operator-run operator-crds dsci dsc rebuild \
        workbench patch-gatewayconfig-tls setup-admin-rbac \
        deploy-model-serving deploy-fraud-tutorial \
@@ -24,6 +32,7 @@ help:
 	@echo ""
 	@echo "Build & Cluster Lifecycle:"
 	@echo "  all                Build everything and create cluster with simulator"
+	@echo "  all-byoidc         Build everything with BYOIDC + Entra mock IDP"
 	@echo "  build-all          Build kind CLI, base image, node image, and sim image"
 	@echo "  cluster            Create the kind cluster (idempotent)"
 	@echo "  cluster-delete     Delete the kind cluster"
@@ -38,6 +47,8 @@ help:
 	@echo "  deploy-sim         Build and deploy the simulator DaemonSet"
 	@echo "  redeploy           Rebuild and redeploy simulator only"
 	@echo "  deploy-maas        Deploy MaaS CRDs + seed (postgres, gateway, tenant)"
+	@echo "  deploy-entra-mock  Deploy Entra ID emulator (OIDC provider) inside cluster"
+	@echo "  deploy-byoidc      Deploy Entra mock + redeploy simulator in BYOIDC mode"
 	@echo "  setup-admin-rbac   Grant admin user cluster-wide permissions"
 	@echo ""
 	@echo "Gateway Stack (Istio + Kuadrant):"
@@ -85,6 +96,17 @@ all: build-all cluster deploy
 	@echo "  make logs"
 	@echo "  https://rh-ai.apps.ocp-sim.test/"
 
+all-byoidc: build-all cluster deploy-crds
+	$(MAKE) deploy-seed AUTH_MODE=byoidc
+	$(MAKE) deploy-byoidc
+	$(MAKE) setup-admin-rbac
+	@echo ""
+	@echo "=== Ready (BYOIDC + Entra Mock) ==="
+	@echo "  kubectl -n entra-mock get pods"
+	@echo "  oc login https://localhost:6443 -u admin -p admin --insecure-skip-tls-verify"
+	@echo "  make status"
+	@echo "  make logs"
+
 rebuild:
 	bash scripts/rebuild.sh
 
@@ -102,7 +124,7 @@ $(KIND_BIN):
 	$(MAKE) -C $(KIND_FORK_DIR) build
 
 kind-base-image:
-	cp $(KIND_FORK_DIR)/cmd/ocp-shim/main.go $(KIND_FORK_DIR)/cmd/ocp-shim/go.mod $(KIND_FORK_DIR)/images/base/ocp-shim/
+	cp $(KIND_FORK_DIR)/cmd/ocp-shim/main.go $(KIND_FORK_DIR)/cmd/ocp-shim/go.mod $(KIND_FORK_DIR)/cmd/ocp-shim/go.sum $(KIND_FORK_DIR)/images/base/ocp-shim/
 	$(SUDO) podman build --build-arg GO_VERSION=1.26.2 -t $(BASE_IMAGE) $(KIND_FORK_DIR)/images/base/
 
 kind-node-image: kind-cli kind-base-image
@@ -164,7 +186,7 @@ cluster-delete:
 # Deploy (CRDs + seed + simulator)
 # ──────────────────────────────────────────────
 
-.PHONY: deploy deploy-crds deploy-seed deploy-sim deploy-maas redeploy
+.PHONY: deploy deploy-crds deploy-seed deploy-sim deploy-maas deploy-entra-mock deploy-byoidc redeploy
 
 deploy: deploy-crds deploy-seed deploy-sim setup-admin-rbac
 
@@ -186,7 +208,12 @@ deploy-seed: deploy-seed-resources deploy-clusterversion deploy-endpoint-patch
 deploy-seed-resources:
 	kubectl apply -f seed/namespaces.yaml
 	kubectl apply -f seed/cluster-config.yaml
+ifeq ($(AUTH_MODE),legacy)
 	kubectl apply -f seed/authentication.yaml
+else
+	kubectl apply -f seed/authentication.yaml
+	kubectl apply -f seed/authentication-oidc.yaml
+endif
 	kubectl apply -f seed/ingress.yaml
 	kubectl apply -f seed/infrastructure.yaml
 	kubectl apply -f seed/sccs.yaml
@@ -216,6 +243,14 @@ deploy-sim: sim-image sim-load
 	kubectl create namespace ocp-sim 2>/dev/null || true
 	kubectl -n ocp-sim create configmap ocp-sim-users --from-file=users.yaml --dry-run=client -o yaml | kubectl apply -f -
 	kubectl apply -f deploy/simulator.yaml
+ifeq ($(AUTH_MODE),oidc)
+	kubectl -n ocp-sim patch daemonset ocp-sim --type=json \
+		-p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["--proxy","--proxy-port","80","--users-file","/etc/ocp-sim/users.yaml","--auth-mode","oidc"]}]'
+endif
+ifeq ($(AUTH_MODE),byoidc)
+	kubectl -n ocp-sim patch daemonset ocp-sim --type=json \
+		-p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["--proxy","--proxy-port","80","--users-file","/etc/ocp-sim/users.yaml","--auth-mode","byoidc","--oidc-issuer-url","$(OIDC_ISSUER_URL)","--oidc-client-id","$(OIDC_CLIENT_ID)","--oidc-client-secret","$(OIDC_CLIENT_SECRET)"]}]'
+endif
 	kubectl -n ocp-sim delete pod --all --wait=false 2>/dev/null || true
 	@sleep 3
 	kubectl wait --namespace ocp-sim \
@@ -227,6 +262,47 @@ deploy-maas:
 	kubectl apply -f crds/maas/
 	kubectl wait --for=condition=Established crd --all --timeout=30s
 	kubectl apply -f seed/maas.yaml
+
+deploy-entra-mock:
+	bash scripts/deploy-entra-mock.sh
+
+BYOIDC_TENANT  ?= a1b2c3d4-e5f6-7890-abcd-ef1234567890
+BYOIDC_ISSUER  := https://entra.apps.ocp-sim.test/$(BYOIDC_TENANT)/v2.0
+
+deploy-byoidc: deploy-entra-mock
+	$(MAKE) deploy-sim AUTH_MODE=byoidc \
+		OIDC_ISSUER_URL=http://entra-mock.entra-mock.svc.cluster.local:8080/$(BYOIDC_TENANT)/v2.0 \
+		OIDC_CLIENT_ID=picoshift \
+		OIDC_CLIENT_SECRET=picoshift-secret
+	$(MAKE) patch-apiserver-oidc
+	@# Patch GatewayConfig with OIDC settings if it exists
+	@if kubectl get gatewayconfig default-gateway >/dev/null 2>&1; then \
+		kubectl create secret generic oidc-client-secret \
+			--from-literal=client-secret=picoshift-secret \
+			-n openshift-ingress --dry-run=client -o yaml | kubectl apply -f -; \
+		kubectl patch gatewayconfig default-gateway --type=merge \
+			-p '{"spec":{"oidc":{"issuerURL":"$(BYOIDC_ISSUER)","clientID":"picoshift","clientSecretRef":{"name":"oidc-client-secret","key":"client-secret"}}}}'; \
+	fi
+
+patch-apiserver-oidc:
+	@echo "Extracting OIDC CA cert from simulator proxy..."
+	@$(SUDO) podman exec $(CLUSTER_NAME)-control-plane sh -c \
+		'echo | openssl s_client -connect localhost:443 -servername entra.apps.ocp-sim.test 2>/dev/null \
+		| openssl x509 -outform PEM > /etc/kubernetes/pki/oidc-ca.crt'
+	@echo "Patching kube-apiserver with OIDC flags..."
+	@$(SUDO) podman exec $(CLUSTER_NAME)-control-plane sh -c \
+		'grep -q -- "--oidc-issuer-url=https://entra" /etc/kubernetes/manifests/kube-apiserver.yaml && exit 0; \
+		sed -i "/--secure-port=16443/a\\        - --oidc-issuer-url=$(BYOIDC_ISSUER)\n        - --oidc-client-id=picoshift\n        - --oidc-username-claim=preferred_username\n        - --oidc-groups-claim=groups\n        - --oidc-username-prefix=-\n        - --oidc-groups-prefix=\n        - --oidc-ca-file=/etc/kubernetes/pki/oidc-ca.crt" \
+		/etc/kubernetes/manifests/kube-apiserver.yaml'
+	@echo "Patching ocp-shim with OIDC issuer URL..."
+	@$(SUDO) podman exec $(CLUSTER_NAME)-control-plane sh -c \
+		'sed -i "s|--oidc-issuer-url=https://localhost:443|--oidc-issuer-url=https://localhost:9443|" \
+		/etc/kubernetes/manifests/kube-apiserver.yaml'
+	@echo "Waiting for kube-apiserver to restart with OIDC..."
+	@sleep 20
+	@kubectl get nodes --request-timeout=60s >/dev/null 2>&1 || sleep 10
+	@kubectl get nodes --request-timeout=60s
+	@echo "kube-apiserver OIDC configuration complete"
 
 redeploy: deploy-sim
 
@@ -257,7 +333,7 @@ status:
 	@echo ""
 	@echo "=== OAuth Server ==="
 	@$(SUDO) podman exec $(CLUSTER_NAME)-control-plane \
-		curl -sk https://localhost:9443/.well-known/oauth-authorization-server 2>/dev/null | python3 -m json.tool \
+		curl -sk https://localhost:443/.well-known/oauth-authorization-server 2>/dev/null | python3 -m json.tool \
 		|| echo "oauth server not reachable"
 	@echo ""
 	@echo "=== OpenShift CRDs ==="
@@ -269,7 +345,7 @@ verify:
 	kubectl get --raw /.well-known/oauth-authorization-server | python3 -m json.tool
 	@echo ""
 	@echo "--- OAuth server (via node) ---"
-	$(SUDO) podman exec $(CLUSTER_NAME)-control-plane curl -sk https://localhost:9443/.well-known/oauth-authorization-server | python3 -m json.tool
+	$(SUDO) podman exec $(CLUSTER_NAME)-control-plane curl -sk https://localhost:443/.well-known/oauth-authorization-server | python3 -m json.tool
 	@echo ""
 	@echo "--- Nodes ---"
 	kubectl get nodes

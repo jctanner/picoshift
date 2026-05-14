@@ -1,0 +1,137 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: entra-mock
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: entra-mock-config
+  namespace: entra-mock
+data:
+  config.yaml: |
+    server:
+      host: "0.0.0.0"
+      port: 8080
+      scheme: "https"
+      external_hostname: "entra.apps.ocp-sim.test"
+      debug: false
+      admin_password: "changeme1234"
+
+    tenants:
+      - id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        domain: "ocp-sim.test"
+        display_name: "Picoshift"
+
+    users:
+      - id: "00000000-0000-0000-0000-000000000001"
+        tenant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        upn: "admin"
+        email: "admin@ocp-sim.test"
+        display_name: "Admin"
+        given_name: "Admin"
+        family_name: "User"
+        password: "admin"
+        groups:
+          - id: "g0000000-0000-0000-0000-cluster-admins"
+            name: "system:cluster-admins"
+          - id: "g0000000-0000-0000-0000-authenticated0"
+            name: "system:authenticated"
+      - id: "00000000-0000-0000-0000-000000000002"
+        tenant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        upn: "user1"
+        email: "user1@ocp-sim.test"
+        display_name: "User1"
+        given_name: "User"
+        family_name: "One"
+        password: "user1"
+        groups:
+          - id: "g0000000-0000-0000-0000-authenticated0"
+            name: "system:authenticated"
+      - id: "00000000-0000-0000-0000-000000000003"
+        tenant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        upn: "developer"
+        email: "developer@ocp-sim.test"
+        display_name: "Developer"
+        given_name: "Dev"
+        family_name: "User"
+        password: "developer"
+        groups:
+          - id: "g0000000-0000-0000-0000-authenticated0"
+            name: "system:authenticated"
+
+    clients:
+      - client_id: "picoshift"
+        tenant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        display_name: "Picoshift"
+        client_secret: "picoshift-secret"
+        client_type: "confidential"
+        application_id_uri: "api://picoshift"
+        redirect_uris:
+          - "https://entra.apps.ocp-sim.test/oauth/callback"
+          - "https://oauth-openshift.apps.ocp-sim.test/oauth/callback"
+          - "https://rh-ai.apps.ocp-sim.test/oauth/callback"
+          - "https://rh-ai.apps.ocp-sim.test/oauth2/callback"
+          - "http://localhost:8080/callback"
+          - "http://localhost:18080/callback"
+          - "urn:ietf:wg:oauth:2.0:oob"
+        allowed_scopes:
+          - "openid"
+          - "profile"
+          - "email"
+          - "offline_access"
+
+    token_lifetimes:
+      access_token_seconds: 86400
+      id_token_seconds: 86400
+      refresh_token_days: 90
+      auth_code_seconds: 300
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: entra-mock
+  namespace: entra-mock
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: entra-mock
+  template:
+    metadata:
+      labels:
+        app: entra-mock
+    spec:
+      containers:
+      - name: entra-mock
+        image: localhost/entra-mock:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8080
+          name: http
+        volumeMounts:
+        - name: config
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+          readOnly: true
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+      volumes:
+      - name: config
+        configMap:
+          name: entra-mock-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: entra-mock
+  namespace: entra-mock
+spec:
+  selector:
+    app: entra-mock
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080

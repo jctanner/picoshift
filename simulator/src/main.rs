@@ -15,6 +15,14 @@ use clap::Parser;
 use rcgen::{CertificateParams, KeyPair};
 use tracing::{info, warn, error};
 
+#[derive(Clone, Debug, Default, clap::ValueEnum)]
+pub enum AuthMode {
+    #[default]
+    Legacy,
+    Oidc,
+    Byoidc,
+}
+
 #[derive(Parser)]
 #[command(name = "ocp-sim", about = "OCP Lite Simulator")]
 struct Args {
@@ -26,6 +34,18 @@ struct Args {
 
     #[arg(long, help = "Path to users.yaml for OAuth user definitions")]
     users_file: Option<String>,
+
+    #[arg(long, value_enum, default_value = "legacy", help = "Auth mode: legacy (sha256~ tokens), oidc (JWT tokens), or byoidc (external OIDC)")]
+    auth_mode: AuthMode,
+
+    #[arg(long, help = "External OIDC issuer URL (used with --auth-mode=byoidc)")]
+    oidc_issuer_url: Option<String>,
+
+    #[arg(long, help = "External OIDC client ID (used with --auth-mode=byoidc)")]
+    oidc_client_id: Option<String>,
+
+    #[arg(long, help = "External OIDC client secret (used with --auth-mode=byoidc)")]
+    oidc_client_secret: Option<String>,
 }
 
 pub struct CaState {
@@ -91,7 +111,17 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(std::future::pending())
     };
     let user_store = Arc::new(oauth::UserStore::load(args.users_file.as_deref()));
-    let oauth_handle = tokio::spawn(oauth::run(client.clone(), ca.clone(), user_store));
+    let auth_mode = args.auth_mode.clone();
+    let byoidc_config = if matches!(auth_mode, AuthMode::Byoidc) {
+        Some(oauth::ByoidcConfig {
+            issuer_url: args.oidc_issuer_url.clone().expect("--oidc-issuer-url required for byoidc mode"),
+            client_id: args.oidc_client_id.clone().expect("--oidc-client-id required for byoidc mode"),
+            client_secret: args.oidc_client_secret.clone().unwrap_or_default(),
+        })
+    } else {
+        None
+    };
+    let oauth_handle = tokio::spawn(oauth::run(client.clone(), ca.clone(), user_store, auth_mode, byoidc_config));
     let proj_handle = tokio::spawn(project::run(client.clone()));
     let scc_handle = tokio::spawn(pod_mutate::run(client.clone(), ca.clone()));
     let jobset_handle = tokio::spawn(jobset::run(client.clone()));

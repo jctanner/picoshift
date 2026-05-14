@@ -23,7 +23,120 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 use url::Url;
 
-use crate::CaState;
+use crate::{AuthMode, CaState};
+
+// ---------------------------------------------------------------------------
+// BYOIDC (external OIDC provider) config
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct ByoidcConfig {
+    pub issuer_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExternalOidcDiscovery {
+    authorization_endpoint: String,
+    token_endpoint: String,
+    #[allow(dead_code)]
+    userinfo_endpoint: String,
+    jwks_uri: String,
+}
+
+struct ExternalJwksCache {
+    keys: RwLock<HashMap<String, jsonwebtoken::DecodingKey>>,
+    discovery: RwLock<ExternalOidcDiscovery>,
+}
+
+impl ExternalJwksCache {
+    async fn new(issuer_url: &str) -> Self {
+        let cache = Self {
+            keys: RwLock::new(HashMap::new()),
+            discovery: RwLock::new(ExternalOidcDiscovery::default()),
+        };
+        cache.refresh(issuer_url).await;
+        cache
+    }
+
+    async fn refresh(&self, issuer_url: &str) {
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+
+        let discovery_url = format!("{}/.well-known/openid-configuration", issuer_url.trim_end_matches('/'));
+        let resp = match client.get(&discovery_url).send().await {
+            Ok(r) => r,
+            Err(e) => { warn!(%e, "BYOIDC: discovery fetch failed"); return; }
+        };
+        let doc: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => { warn!(%e, "BYOIDC: discovery parse failed"); return; }
+        };
+
+        let disc = ExternalOidcDiscovery {
+            authorization_endpoint: doc.get("authorization_endpoint").and_then(|v| v.as_str()).unwrap_or_default().into(),
+            token_endpoint: doc.get("token_endpoint").and_then(|v| v.as_str()).unwrap_or_default().into(),
+            userinfo_endpoint: doc.get("userinfo_endpoint").and_then(|v| v.as_str()).unwrap_or_default().into(),
+            jwks_uri: doc.get("jwks_uri").and_then(|v| v.as_str()).unwrap_or_default().into(),
+        };
+
+        let jwks_uri = disc.jwks_uri.clone();
+        *self.discovery.write().await = disc;
+
+        if jwks_uri.is_empty() {
+            warn!("BYOIDC: no jwks_uri in discovery");
+            return;
+        }
+
+        let resp = match client.get(&jwks_uri).send().await {
+            Ok(r) => r,
+            Err(e) => { warn!(%e, "BYOIDC: JWKS fetch failed"); return; }
+        };
+        let jwks: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => { warn!(%e, "BYOIDC: JWKS parse failed"); return; }
+        };
+
+        let mut new_keys = HashMap::new();
+        if let Some(keys) = jwks.get("keys").and_then(|k| k.as_array()) {
+            for key in keys {
+                let kty = key.get("kty").and_then(|v| v.as_str()).unwrap_or_default();
+                let kid = key.get("kid").and_then(|v| v.as_str()).unwrap_or_default();
+                if kty != "RSA" { continue; }
+                let n = key.get("n").and_then(|v| v.as_str()).unwrap_or_default();
+                let e = key.get("e").and_then(|v| v.as_str()).unwrap_or_default();
+                match jsonwebtoken::DecodingKey::from_rsa_components(n, e) {
+                    Ok(dk) => { new_keys.insert(kid.to_string(), dk); }
+                    Err(e) => { warn!(%e, kid, "BYOIDC: failed to parse RSA key"); }
+                }
+            }
+        }
+
+        info!(count = new_keys.len(), "BYOIDC: loaded JWKS keys");
+        *self.keys.write().await = new_keys;
+    }
+
+    async fn validate_token(&self, token: &str) -> Option<serde_json::Value> {
+        use base64::Engine;
+        let header_part = token.split('.').next()?;
+        let header_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(header_part).ok()?;
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
+        let kid = header.get("kid").and_then(|v| v.as_str()).unwrap_or_default();
+
+        let keys = self.keys.read().await;
+        let dk = keys.get(kid)?;
+
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        validation.validate_aud = false;
+        match jsonwebtoken::decode::<serde_json::Value>(token, dk, &validation) {
+            Ok(data) => Some(data.claims),
+            Err(e) => { warn!(%e, "BYOIDC: JWT validation failed"); None }
+        }
+    }
+}
 
 const OAUTH_PORT: u16 = 9443;
 const DOMAIN: &str = "apps.ocp-sim.test";
@@ -93,6 +206,86 @@ impl UserStore {
 }
 
 // ---------------------------------------------------------------------------
+// JWT keys (OIDC mode)
+// ---------------------------------------------------------------------------
+
+struct JwtKeys {
+    encoding_key: jsonwebtoken::EncodingKey,
+    kid: String,
+    n_b64: String,
+    e_b64: String,
+}
+
+impl JwtKeys {
+    fn generate() -> Self {
+        use base64::Engine;
+        use jsonwebtoken::EncodingKey;
+
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+            .expect("failed to generate RSA key pair");
+        let private_pem = key_pair.serialize_pem();
+        let encoding_key = EncodingKey::from_rsa_pem(private_pem.as_bytes())
+            .expect("failed to create encoding key from PEM");
+
+        // public_key_raw() returns the raw RSA public key: DER SEQUENCE { INTEGER n, INTEGER e }
+        let raw = key_pair.public_key_raw();
+        let (n_bytes, e_bytes) = Self::parse_rsa_integers(raw);
+
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let n_b64 = engine.encode(&n_bytes);
+        let e_b64 = engine.encode(&e_bytes);
+
+        let kid = generate_random_string(12);
+
+        info!(kid = %kid, "generated RSA signing key for OIDC mode");
+
+        Self { encoding_key, kid, n_b64, e_b64 }
+    }
+
+    // Parse DER SEQUENCE { INTEGER n, INTEGER e } → (n_bytes, e_bytes)
+    fn parse_rsa_integers(der: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut pos = 0;
+        // SEQUENCE tag + length
+        pos += 1; // tag 0x30
+        pos += Self::der_len_size(&der[pos..]);
+
+        // INTEGER n
+        pos += 1; // tag 0x02
+        let n_len = Self::read_der_len(&der[pos..]);
+        pos += Self::der_len_size(&der[pos..]);
+        let mut n = der[pos..pos + n_len].to_vec();
+        if !n.is_empty() && n[0] == 0 { n.remove(0); }
+        pos += n_len;
+
+        // INTEGER e
+        pos += 1; // tag 0x02
+        let e_len = Self::read_der_len(&der[pos..]);
+        pos += Self::der_len_size(&der[pos..]);
+        let e = der[pos..pos + e_len].to_vec();
+
+        (n, e)
+    }
+
+    fn der_len_size(der: &[u8]) -> usize {
+        if der[0] < 0x80 { 1 } else { 1 + (der[0] & 0x7f) as usize }
+    }
+
+    fn read_der_len(der: &[u8]) -> usize {
+        let first = der[0];
+        if first < 0x80 {
+            first as usize
+        } else {
+            let num = (first & 0x7f) as usize;
+            let mut len = 0usize;
+            for i in 0..num {
+                len = (len << 8) | der[1 + i] as usize;
+            }
+            len
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // OAuth state
 // ---------------------------------------------------------------------------
 
@@ -113,14 +306,33 @@ struct OAuthState {
     codes: RwLock<HashMap<String, AuthCode>>,
     tokens: RwLock<HashMap<String, TokenInfo>>,
     user_store: Arc<UserStore>,
+    auth_mode: AuthMode,
+    jwt_keys: Option<Arc<JwtKeys>>,
+    byoidc: Option<Arc<ByoidcConfig>>,
+    external_jwks: Option<Arc<ExternalJwksCache>>,
 }
 
 impl OAuthState {
-    fn new(user_store: Arc<UserStore>) -> Self {
+    async fn new(user_store: Arc<UserStore>, auth_mode: AuthMode, byoidc: Option<ByoidcConfig>) -> Self {
+        let jwt_keys = if matches!(auth_mode, AuthMode::Oidc) {
+            Some(Arc::new(JwtKeys::generate()))
+        } else {
+            None
+        };
+        let (byoidc_arc, external_jwks) = if let Some(cfg) = byoidc {
+            let cache = Arc::new(ExternalJwksCache::new(&cfg.issuer_url).await);
+            (Some(Arc::new(cfg)), Some(cache))
+        } else {
+            (None, None)
+        };
         Self {
             codes: RwLock::new(HashMap::new()),
             tokens: RwLock::new(HashMap::new()),
             user_store,
+            auth_mode,
+            jwt_keys,
+            byoidc: byoidc_arc,
+            external_jwks,
         }
     }
 }
@@ -138,9 +350,20 @@ fn generate_random_string(len: usize) -> String {
         .collect()
 }
 
-fn discovery_json() -> String {
-    let base = format!("https://{OAUTH_HOST}.{DOMAIN}:{OAUTH_PORT}");
-    serde_json::json!({
+fn discovery_json(auth_mode: &AuthMode) -> String {
+    if matches!(auth_mode, AuthMode::Byoidc) {
+        let local = format!("https://localhost:{OAUTH_PORT}");
+        return serde_json::json!({
+            "issuer": local,
+            "jwks_uri": format!("{local}/oauth/jwks"),
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+            "subject_types_supported": ["public"]
+        }).to_string();
+    }
+    let base = format!("https://{OAUTH_HOST}.{DOMAIN}");
+    let mut doc = serde_json::json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/oauth/authorize"),
         "token_endpoint": format!("{base}/oauth/token"),
@@ -148,8 +371,16 @@ fn discovery_json() -> String {
         "response_types_supported": ["code", "token"],
         "grant_types_supported": ["authorization_code", "implicit"],
         "code_challenge_methods_supported": ["plain", "S256"]
-    })
-    .to_string()
+    });
+    if matches!(auth_mode, AuthMode::Oidc) {
+        let obj = doc.as_object_mut().unwrap();
+        obj.insert("userinfo_endpoint".into(), format!("{base}/oauth/userinfo").into());
+        obj.insert("jwks_uri".into(), format!("{base}/oauth/jwks").into());
+        obj.insert("id_token_signing_alg_values_supported".into(), serde_json::json!(["RS256"]));
+        obj.insert("subject_types_supported".into(), serde_json::json!(["public"]));
+        obj.insert("token_endpoint_auth_methods_supported".into(), serde_json::json!(["client_secret_post", "client_secret_basic"]));
+    }
+    doc.to_string()
 }
 
 fn json_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
@@ -602,7 +833,44 @@ async fn handle_token(
         );
     }
 
-    let token = format!("sha256~{}", generate_random_string(43));
+    let username = &auth_code.username;
+    let token = if let Some(jwt_keys) = &state.jwt_keys {
+        let (email, groups) = match state.user_store.get(username) {
+            Some(entry) => {
+                let email = entry.email.clone().unwrap_or_else(|| format!("{username}@ocp-sim.test"));
+                let groups = entry.groups.clone().unwrap_or_else(|| vec!["system:authenticated".into()]);
+                (email, groups)
+            }
+            None => (format!("{username}@ocp-sim.test"), vec!["system:authenticated".into()]),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let issuer = format!("https://{OAUTH_HOST}.{DOMAIN}");
+        let claims = serde_json::json!({
+            "iss": issuer,
+            "sub": username,
+            "aud": client_id,
+            "preferred_username": username,
+            "email": email,
+            "groups": groups,
+            "iat": now,
+            "exp": now + TOKEN_TTL.as_secs(),
+        });
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some(jwt_keys.kid.clone());
+        match jsonwebtoken::encode(&header, &claims, &jwt_keys.encoding_key) {
+            Ok(jwt) => jwt,
+            Err(e) => {
+                warn!(%e, "failed to encode JWT");
+                return json_response(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"server_error"}"#);
+            }
+        }
+    } else {
+        format!("sha256~{}", generate_random_string(43))
+    };
+
     state.tokens.write().await.insert(
         token.clone(),
         TokenInfo {
@@ -612,7 +880,7 @@ async fn handle_token(
         },
     );
 
-    info!(username = %auth_code.username, "token: issued access_token");
+    info!(username = %auth_code.username, jwt = state.jwt_keys.is_some(), "token: issued access_token");
 
     json_response(
         StatusCode::OK,
@@ -623,6 +891,38 @@ async fn handle_token(
         })
         .to_string(),
     )
+}
+
+fn decode_jwt_username(token: &str) -> Option<String> {
+    use base64::Engine;
+    let parts: Vec<&str> = token.splitn(3, '.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    claims.get("preferred_username")
+        .or_else(|| claims.get("sub"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn handle_jwks(state: &OAuthState) -> Response<Full<Bytes>> {
+    let keys = if let Some(jwt_keys) = &state.jwt_keys {
+        serde_json::json!([{
+            "kty": "RSA",
+            "use": "sig",
+            "kid": jwt_keys.kid,
+            "alg": "RS256",
+            "n": jwt_keys.n_b64,
+            "e": jwt_keys.e_b64,
+        }])
+    } else {
+        serde_json::json!([])
+    };
+    json_response(StatusCode::OK, &serde_json::json!({"keys": keys}).to_string())
 }
 
 async fn handle_userinfo(state: &OAuthState, req: &Request<Incoming>) -> Response<Full<Bytes>> {
@@ -638,15 +938,21 @@ async fn handle_userinfo(state: &OAuthState, req: &Request<Incoming>) -> Respons
         return json_response(StatusCode::UNAUTHORIZED, r#"{"error":"missing bearer token"}"#);
     };
 
-    let tokens = state.tokens.read().await;
-    let token_info = match tokens.get(&token) {
-        Some(info) if info.created.elapsed() < TOKEN_TTL => info,
-        _ => {
-            return json_response(StatusCode::UNAUTHORIZED, r#"{"error":"invalid_token"}"#);
+    // Try JWT decode first (OIDC mode tokens start with eyJ)
+    let username: String = if token.starts_with("eyJ") {
+        match decode_jwt_username(&token) {
+            Some(u) => u,
+            None => return json_response(StatusCode::UNAUTHORIZED, r#"{"error":"invalid_token"}"#),
+        }
+    } else {
+        let tokens = state.tokens.read().await;
+        match tokens.get(&token) {
+            Some(info) if info.created.elapsed() < TOKEN_TTL => info.username.clone(),
+            _ => return json_response(StatusCode::UNAUTHORIZED, r#"{"error":"invalid_token"}"#),
         }
     };
 
-    let username = &token_info.username;
+    let username = &username;
     let (email, groups) = match state.user_store.get(username) {
         Some(entry) => {
             let email = entry
@@ -679,6 +985,293 @@ async fn handle_userinfo(state: &OAuthState, req: &Request<Incoming>) -> Respons
 }
 
 // ---------------------------------------------------------------------------
+// BYOIDC handlers
+// ---------------------------------------------------------------------------
+
+async fn handle_byoidc_authorize(
+    state: &OAuthState,
+    req: &Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let byoidc = match &state.byoidc {
+        Some(c) => c,
+        None => return text_response(StatusCode::INTERNAL_SERVER_ERROR, "BYOIDC not configured\n"),
+    };
+    let external_jwks = match &state.external_jwks {
+        Some(c) => c,
+        None => return text_response(StatusCode::INTERNAL_SERVER_ERROR, "BYOIDC JWKS not loaded\n"),
+    };
+
+    let disc = external_jwks.discovery.read().await;
+    if disc.authorization_endpoint.is_empty() {
+        return text_response(StatusCode::BAD_GATEWAY, "external authorization_endpoint not discovered\n");
+    }
+
+    let params = parse_query(req.uri());
+    let redirect_uri = params.get("redirect_uri").cloned().unwrap_or_default();
+    let req_state = params.get("state").cloned().unwrap_or_default();
+
+    let ext_url = match Url::parse(&disc.authorization_endpoint) {
+        Ok(u) => u,
+        Err(_) => return text_response(StatusCode::BAD_GATEWAY, "invalid external authorization_endpoint\n"),
+    };
+    let base = format!("https://entra.{DOMAIN}");
+    let mut auth_url = Url::parse(&format!("{}{}", base, ext_url.path())).unwrap();
+
+    auth_url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &byoidc.client_id)
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("scope", "openid email profile api://picoshift/.default")
+        .append_pair("state", &req_state);
+
+    info!(redirect = %auth_url, "BYOIDC: redirecting to external provider (proxied)");
+
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header("location", auth_url.as_str())
+        .body(Full::new(Bytes::new()))
+        .unwrap()
+}
+
+async fn handle_byoidc_token(
+    client_k8s: &Client,
+    state: &OAuthState,
+    body: &[u8],
+) -> Response<Full<Bytes>> {
+    let byoidc = match &state.byoidc {
+        Some(c) => c,
+        None => return json_response(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"byoidc_not_configured"}"#),
+    };
+    let external_jwks = match &state.external_jwks {
+        Some(c) => c,
+        None => return json_response(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"byoidc_jwks_not_loaded"}"#),
+    };
+
+    let disc = external_jwks.discovery.read().await;
+    if disc.token_endpoint.is_empty() {
+        return json_response(StatusCode::BAD_GATEWAY, r#"{"error":"no_external_token_endpoint"}"#);
+    }
+
+    let params = parse_form_body(body);
+    let code = params.get("code").cloned().unwrap_or_default();
+    let redirect_uri = params.get("redirect_uri").cloned().unwrap_or_default();
+
+    let http_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+
+    let resp = match http_client
+        .post(&disc.token_endpoint)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("client_id", &byoidc.client_id),
+            ("client_secret", &byoidc.client_secret),
+            ("redirect_uri", &redirect_uri),
+        ])
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(%e, "BYOIDC: token exchange failed");
+            return json_response(StatusCode::BAD_GATEWAY, r#"{"error":"token_exchange_failed"}"#);
+        }
+    };
+
+    let token_resp: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(%e, "BYOIDC: token response parse failed");
+            return json_response(StatusCode::BAD_GATEWAY, r#"{"error":"token_parse_failed"}"#);
+        }
+    };
+
+    if let Some(access_token) = token_resp.get("access_token").and_then(|v| v.as_str()) {
+        if let Some(claims) = external_jwks.validate_token(access_token).await {
+            let username = claims.get("preferred_username")
+                .or_else(|| claims.get("email"))
+                .or_else(|| claims.get("sub"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            ensure_user_and_identity(client_k8s, username).await;
+            info!(username, "BYOIDC: token exchange successful");
+        } else if let Some(id_token) = token_resp.get("id_token").and_then(|v| v.as_str()) {
+            if let Some(claims) = external_jwks.validate_token(id_token).await {
+                let username = claims.get("preferred_username")
+                    .or_else(|| claims.get("email"))
+                    .or_else(|| claims.get("sub"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                ensure_user_and_identity(client_k8s, username).await;
+                info!(username, "BYOIDC: token exchange successful (via id_token)");
+            }
+        }
+    }
+
+    json_response(StatusCode::OK, &token_resp.to_string())
+}
+
+async fn handle_byoidc_userinfo(
+    state: &OAuthState,
+    req: &Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let external_jwks = match &state.external_jwks {
+        Some(c) => c,
+        None => return json_response(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"byoidc_not_configured"}"#),
+    };
+
+    let auth = req
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+
+    let token = if let Some(t) = auth.strip_prefix("Bearer ") {
+        t
+    } else {
+        return json_response(StatusCode::UNAUTHORIZED, r#"{"error":"missing bearer token"}"#);
+    };
+
+    match external_jwks.validate_token(token).await {
+        Some(claims) => {
+            let username = claims.get("preferred_username")
+                .or_else(|| claims.get("email"))
+                .or_else(|| claims.get("sub"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let email = claims.get("email")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let groups: Vec<String> = claims.get("groups")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_else(|| vec!["system:authenticated".into()]);
+
+            json_response(StatusCode::OK, &serde_json::json!({
+                "sub": username,
+                "name": username,
+                "preferred_username": username,
+                "email": email,
+                "groups": groups,
+            }).to_string())
+        }
+        None => json_response(StatusCode::UNAUTHORIZED, r#"{"error":"invalid_token"}"#),
+    }
+}
+
+async fn handle_byoidc_jwks(state: &OAuthState) -> Response<Full<Bytes>> {
+    let external_jwks = match &state.external_jwks {
+        Some(c) => c,
+        None => return json_response(StatusCode::OK, r#"{"keys":[]}"#),
+    };
+    let _byoidc = match &state.byoidc {
+        Some(c) => c,
+        None => return json_response(StatusCode::OK, r#"{"keys":[]}"#),
+    };
+
+    let http_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+
+    let disc = external_jwks.discovery.read().await;
+    if disc.jwks_uri.is_empty() {
+        return json_response(StatusCode::OK, r#"{"keys":[]}"#);
+    }
+
+    match http_client.get(&disc.jwks_uri).send().await {
+        Ok(resp) => match resp.text().await {
+            Ok(body) => json_response(StatusCode::OK, &body),
+            Err(_) => json_response(StatusCode::OK, r#"{"keys":[]}"#),
+        },
+        Err(e) => {
+            warn!(%e, url = %disc.jwks_uri, "BYOIDC: failed to fetch external JWKS");
+            json_response(StatusCode::OK, r#"{"keys":[]}"#)
+        }
+    }
+}
+
+async fn handle_byoidc_proxy(
+    state: &OAuthState,
+    method: &Method,
+    path: &str,
+    query: Option<&str>,
+    body: &[u8],
+    content_type: Option<&str>,
+    authorization: Option<&str>,
+) -> Response<Full<Bytes>> {
+    let byoidc = match &state.byoidc {
+        Some(c) => c,
+        None => return text_response(StatusCode::BAD_GATEWAY, "BYOIDC not configured\n"),
+    };
+
+    // Derive the entra-mock base URL (scheme+host) from the issuer URL
+    let issuer_parsed = match Url::parse(&byoidc.issuer_url) {
+        Ok(u) => u,
+        Err(_) => return text_response(StatusCode::BAD_GATEWAY, "invalid issuer URL\n"),
+    };
+    let base = format!("{}://{}", issuer_parsed.scheme(), issuer_parsed.host_str().unwrap_or("localhost"));
+    let port = issuer_parsed.port().map(|p| format!(":{}", p)).unwrap_or_default();
+    let mut target_url = format!("{}{}{}", base, port, path);
+    if let Some(q) = query {
+        target_url.push('?');
+        target_url.push_str(q);
+    }
+
+    info!(%target_url, %method, "BYOIDC: proxying to external provider");
+
+    let http_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+
+    let mut req_builder = match *method {
+        Method::POST => {
+            let mut b = http_client.post(&target_url).body(body.to_vec());
+            if let Some(ct) = content_type {
+                b = b.header("content-type", ct);
+            }
+            b
+        }
+        _ => http_client.get(&target_url),
+    };
+    if let Some(auth) = authorization {
+        req_builder = req_builder.header("authorization", auth);
+    }
+
+    let resp = match req_builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(%e, "BYOIDC: proxy request failed");
+            return text_response(StatusCode::BAD_GATEWAY, "proxy request failed\n");
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+
+    if let Some(loc) = resp.headers().get("location") {
+        builder = builder.header("location", loc);
+    }
+    if let Some(ct) = resp.headers().get("content-type") {
+        builder = builder.header("content-type", ct);
+    }
+    for val in resp.headers().get_all("set-cookie").iter() {
+        builder = builder.header("set-cookie", val);
+    }
+
+    let resp_body = resp.bytes().await.unwrap_or_default();
+    builder.body(Full::new(resp_body)).unwrap()
+}
+
+fn is_cli_auth_request(req: &Request<Incoming>) -> bool {
+    req.headers().contains_key("authorization") || req.headers().contains_key("x-csrf-token")
+}
+
+// ---------------------------------------------------------------------------
 // Request router
 // ---------------------------------------------------------------------------
 
@@ -687,28 +1280,61 @@ async fn handle_request(
     state: Arc<OAuthState>,
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    use http_body_util::BodyExt;
+
     let path = req.uri().path().to_string();
     let method = req.method().clone();
+    let is_byoidc = matches!(state.auth_mode, AuthMode::Byoidc);
 
-    match (method, path.as_str()) {
-        (Method::GET, "/.well-known/oauth-authorization-server") => {
-            Ok(json_response(StatusCode::OK, &discovery_json()))
+    // Routes that don't consume the body (GET handlers that need &Request)
+    match (method.clone(), path.as_str()) {
+        (Method::GET, "/.well-known/oauth-authorization-server") |
+        (Method::GET, "/.well-known/openid-configuration") => {
+            return Ok(json_response(StatusCode::OK, &discovery_json(&state.auth_mode)));
+        }
+        (Method::GET, "/oauth/jwks") => {
+            return if is_byoidc {
+                Ok(handle_byoidc_jwks(&state).await)
+            } else {
+                Ok(handle_jwks(&state))
+            };
         }
         (Method::GET, "/oauth/authorize") => {
-            Ok(handle_authorize_get(&client, &state, &req).await)
+            if is_byoidc && !is_cli_auth_request(&req) {
+                return Ok(handle_byoidc_authorize(&state, &req).await);
+            } else {
+                return Ok(handle_authorize_get(&client, &state, &req).await);
+            }
         }
+        (Method::GET, "/oauth/userinfo") => {
+            return if is_byoidc {
+                Ok(handle_byoidc_userinfo(&state, &req).await)
+            } else {
+                Ok(handle_userinfo(&state, &req).await)
+            };
+        }
+        _ => {}
+    }
+
+    // Routes that consume the body (POST handlers + proxy)
+    let query = req.uri().query().map(|q| q.to_string());
+    let content_type = req.headers().get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
+    let authorization = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
+    let body = req.collect().await?.to_bytes();
+
+    match (method.clone(), path.as_str()) {
         (Method::POST, "/oauth/authorize") => {
-            use http_body_util::BodyExt;
-            let body = req.collect().await?.to_bytes();
             Ok(handle_authorize_post(&client, &state, &body).await)
         }
         (Method::POST, "/oauth/token") => {
-            use http_body_util::BodyExt;
-            let body = req.collect().await?.to_bytes();
-            Ok(handle_token(&client, &state, &body).await)
+            if is_byoidc {
+                Ok(handle_byoidc_token(&client, &state, &body).await)
+            } else {
+                Ok(handle_token(&client, &state, &body).await)
+            }
         }
-        (Method::GET, "/oauth/userinfo") => {
-            Ok(handle_userinfo(&state, &req).await)
+        _ if is_byoidc && (path.contains("/oauth2/") || path.contains("/v2.0/") || path.starts_with("/oidc/")) => {
+            Ok(handle_byoidc_proxy(&state, &method, &path, query.as_deref(), &body, content_type.as_deref(), authorization.as_deref()).await)
         }
         _ => Ok(text_response(StatusCode::NOT_FOUND, "not found\n")),
     }
@@ -725,7 +1351,8 @@ fn generate_tls_config(ca: &CaState) -> Result<ServerConfig, Box<dyn std::error:
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let issuer = Issuer::from_params(&ca_params, &ca_key);
 
-    let mut params = CertificateParams::new(vec![cn.clone()])?;
+    let entra_host = format!("entra.{DOMAIN}");
+    let mut params = CertificateParams::new(vec![cn.clone(), entra_host])?;
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
         rcgen::DnValue::Utf8String(cn.clone()),
@@ -749,7 +1376,7 @@ fn generate_tls_config(ca: &CaState) -> Result<ServerConfig, Box<dyn std::error:
     Ok(config)
 }
 
-async fn setup_infrastructure(client: &Client) -> anyhow::Result<()> {
+async fn setup_infrastructure(client: &Client, auth_mode: &AuthMode) -> anyhow::Result<()> {
     let ns_api: Api<Namespace> = Api::all(client.clone());
     let ns = Namespace {
         metadata: ObjectMeta {
@@ -767,73 +1394,144 @@ async fn setup_infrastructure(client: &Client) -> anyhow::Result<()> {
     let node_ip = get_node_ip(client).await?;
     info!(node_ip, "discovered node IP for OAuth service");
 
-    let svc_api: Api<Service> = Api::namespaced(client.clone(), OAUTH_NS);
-    let svc = Service {
-        metadata: ObjectMeta {
-            name: Some(OAUTH_HOST.to_string()),
-            namespace: Some(OAUTH_NS.to_string()),
+    if matches!(auth_mode, AuthMode::Byoidc) {
+        // BYOIDC: clean up any leftover oauth-openshift resources from prior deployments
+        let svc_api: Api<Service> = Api::namespaced(client.clone(), OAUTH_NS);
+        match svc_api.delete(OAUTH_HOST, &Default::default()).await {
+            Ok(_) => info!("deleted leftover service {OAUTH_HOST}"),
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => warn!(%e, "failed to delete leftover service {OAUTH_HOST}"),
+        }
+        let ep_api: Api<Endpoints> = Api::namespaced(client.clone(), OAUTH_NS);
+        match ep_api.delete(OAUTH_HOST, &Default::default()).await {
+            Ok(_) => info!("deleted leftover endpoints {OAUTH_HOST}"),
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => warn!(%e, "failed to delete leftover endpoints {OAUTH_HOST}"),
+        }
+        {
+            let ar = ApiResource {
+                group: "route.openshift.io".into(),
+                version: "v1".into(),
+                api_version: "route.openshift.io/v1".into(),
+                kind: "Route".into(),
+                plural: "routes".into(),
+            };
+            let routes: Api<DynamicObject> = Api::namespaced_with(client.clone(), OAUTH_NS, &ar);
+            match routes.delete(OAUTH_HOST, &Default::default()).await {
+                Ok(_) => info!("deleted leftover route {OAUTH_HOST}"),
+                Err(kube::Error::Api(e)) if e.code == 404 => {}
+                Err(e) => warn!(%e, "failed to delete leftover route {OAUTH_HOST}"),
+            }
+        }
+
+        let svc_api: Api<Service> = Api::namespaced(client.clone(), OAUTH_NS);
+        let svc = Service {
+            metadata: ObjectMeta {
+                name: Some("entra".to_string()),
+                namespace: Some(OAUTH_NS.to_string()),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                cluster_ip: Some("None".to_string()),
+                ports: Some(vec![ServicePort {
+                    name: Some("https".to_string()),
+                    port: OAUTH_PORT as i32,
+                    target_port: Some(IntOrString::Int(OAUTH_PORT as i32)),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
             ..Default::default()
-        },
-        spec: Some(ServiceSpec {
-            cluster_ip: Some("None".to_string()),
-            ports: Some(vec![ServicePort {
-                name: Some("https".to_string()),
-                port: OAUTH_PORT as i32,
-                target_port: Some(IntOrString::Int(OAUTH_PORT as i32)),
-                protocol: Some("TCP".to_string()),
+        };
+        match svc_api.patch("entra", &PatchParams::apply("ocp-sim"), &Patch::Apply(svc)).await {
+            Ok(_) => info!("created/updated service entra in {OAUTH_NS}"),
+            Err(e) => warn!(%e, "failed to create entra service"),
+        }
+
+        let ep_api: Api<Endpoints> = Api::namespaced(client.clone(), OAUTH_NS);
+        let ep = Endpoints {
+            metadata: ObjectMeta {
+                name: Some("entra".to_string()),
+                namespace: Some(OAUTH_NS.to_string()),
+                ..Default::default()
+            },
+            subsets: Some(vec![EndpointSubset {
+                addresses: Some(vec![EndpointAddress {
+                    ip: node_ip.clone(),
+                    ..Default::default()
+                }]),
+                ports: Some(vec![EndpointPort {
+                    name: Some("https".to_string()),
+                    port: OAUTH_PORT as i32,
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }]),
                 ..Default::default()
             }]),
+        };
+        match ep_api.patch("entra", &PatchParams::apply("ocp-sim"), &Patch::Apply(ep)).await {
+            Ok(_) => info!("created/updated endpoints for entra"),
+            Err(e) => warn!(%e, "failed to create entra endpoints"),
+        }
+
+        create_oauth_route(client, &format!("entra.{DOMAIN}"), "entra").await?;
+    } else {
+        let svc_api: Api<Service> = Api::namespaced(client.clone(), OAUTH_NS);
+        let svc = Service {
+            metadata: ObjectMeta {
+                name: Some(OAUTH_HOST.to_string()),
+                namespace: Some(OAUTH_NS.to_string()),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                cluster_ip: Some("None".to_string()),
+                ports: Some(vec![ServicePort {
+                    name: Some("https".to_string()),
+                    port: OAUTH_PORT as i32,
+                    target_port: Some(IntOrString::Int(OAUTH_PORT as i32)),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
-        ..Default::default()
-    };
-    match svc_api
-        .patch(
-            OAUTH_HOST,
-            &PatchParams::apply("ocp-sim"),
-            &Patch::Apply(svc),
-        )
-        .await
-    {
-        Ok(_) => info!("created/updated service {OAUTH_HOST} in {OAUTH_NS}"),
-        Err(e) => warn!(%e, "failed to create oauth service"),
+        };
+        match svc_api.patch(OAUTH_HOST, &PatchParams::apply("ocp-sim"), &Patch::Apply(svc)).await {
+            Ok(_) => info!("created/updated service {OAUTH_HOST} in {OAUTH_NS}"),
+            Err(e) => warn!(%e, "failed to create oauth service"),
+        }
+
+        let ep_api: Api<Endpoints> = Api::namespaced(client.clone(), OAUTH_NS);
+        let ep = Endpoints {
+            metadata: ObjectMeta {
+                name: Some(OAUTH_HOST.to_string()),
+                namespace: Some(OAUTH_NS.to_string()),
+                ..Default::default()
+            },
+            subsets: Some(vec![EndpointSubset {
+                addresses: Some(vec![EndpointAddress {
+                    ip: node_ip.clone(),
+                    ..Default::default()
+                }]),
+                ports: Some(vec![EndpointPort {
+                    name: Some("https".to_string()),
+                    port: OAUTH_PORT as i32,
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }]),
+        };
+        match ep_api.patch(OAUTH_HOST, &PatchParams::apply("ocp-sim"), &Patch::Apply(ep)).await {
+            Ok(_) => info!("created/updated endpoints for {OAUTH_HOST}"),
+            Err(e) => warn!(%e, "failed to create oauth endpoints"),
+        }
+
+        create_oauth_route(client, &format!("{OAUTH_HOST}.{DOMAIN}"), OAUTH_HOST).await?;
     }
 
-    let ep_api: Api<Endpoints> = Api::namespaced(client.clone(), OAUTH_NS);
-    let ep = Endpoints {
-        metadata: ObjectMeta {
-            name: Some(OAUTH_HOST.to_string()),
-            namespace: Some(OAUTH_NS.to_string()),
-            ..Default::default()
-        },
-        subsets: Some(vec![EndpointSubset {
-            addresses: Some(vec![EndpointAddress {
-                ip: node_ip.clone(),
-                ..Default::default()
-            }]),
-            ports: Some(vec![EndpointPort {
-                name: Some("https".to_string()),
-                port: OAUTH_PORT as i32,
-                protocol: Some("TCP".to_string()),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        }]),
-    };
-    match ep_api
-        .patch(
-            OAUTH_HOST,
-            &PatchParams::apply("ocp-sim"),
-            &Patch::Apply(ep),
-        )
-        .await
-    {
-        Ok(_) => info!("created/updated endpoints for {OAUTH_HOST}"),
-        Err(e) => warn!(%e, "failed to create oauth endpoints"),
-    }
-
-    create_oauth_route(client).await?;
-    patch_coredns(client, &node_ip).await?;
+    patch_coredns(client, &node_ip, auth_mode).await?;
 
     Ok(())
 }
@@ -856,7 +1554,7 @@ async fn get_node_ip(client: &Client) -> anyhow::Result<String> {
     anyhow::bail!("no node with InternalIP found")
 }
 
-async fn create_oauth_route(client: &Client) -> anyhow::Result<()> {
+async fn create_oauth_route(client: &Client, host: &str, svc_name: &str) -> anyhow::Result<()> {
     let ar = ApiResource {
         group: "route.openshift.io".into(),
         version: "v1".into(),
@@ -866,19 +1564,19 @@ async fn create_oauth_route(client: &Client) -> anyhow::Result<()> {
     };
     let routes: Api<DynamicObject> = Api::namespaced_with(client.clone(), OAUTH_NS, &ar);
 
-    let host = format!("{OAUTH_HOST}.{DOMAIN}");
+    let route_name = host.split('.').next().unwrap_or(host);
     let route = serde_json::json!({
         "apiVersion": "route.openshift.io/v1",
         "kind": "Route",
         "metadata": {
-            "name": OAUTH_HOST,
+            "name": route_name,
             "namespace": OAUTH_NS
         },
         "spec": {
             "host": host,
             "to": {
                 "kind": "Service",
-                "name": OAUTH_HOST
+                "name": svc_name
             },
             "port": {
                 "targetPort": "https"
@@ -891,7 +1589,7 @@ async fn create_oauth_route(client: &Client) -> anyhow::Result<()> {
 
     match routes
         .patch(
-            OAUTH_HOST,
+            route_name,
             &PatchParams::apply("ocp-sim"),
             &Patch::Apply(serde_json::from_value::<DynamicObject>(route)?),
         )
@@ -904,7 +1602,7 @@ async fn create_oauth_route(client: &Client) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn patch_coredns(client: &Client, node_ip: &str) -> anyhow::Result<()> {
+async fn patch_coredns(client: &Client, node_ip: &str, auth_mode: &AuthMode) -> anyhow::Result<()> {
     let cm_api: Api<k8s_openapi::api::core::v1::ConfigMap> =
         Api::namespaced(client.clone(), "kube-system");
 
@@ -921,8 +1619,13 @@ async fn patch_coredns(client: &Client, node_ip: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let hosts_entries = if matches!(auth_mode, AuthMode::Byoidc) {
+        format!("        {node_ip} entra.apps.ocp-sim.test")
+    } else {
+        format!("        {node_ip} oauth-openshift.apps.ocp-sim.test")
+    };
     let hosts_block = format!(
-        "\napps.ocp-sim.test:53 {{\n    hosts {{\n        {node_ip} oauth-openshift.apps.ocp-sim.test\n        fallthrough\n    }}\n}}\n"
+        "\napps.ocp-sim.test:53 {{\n    hosts {{\n{hosts_entries}\n        fallthrough\n    }}\n}}\n"
     );
     let new_corefile = format!("{corefile}{hosts_block}");
 
@@ -957,16 +1660,23 @@ async fn patch_coredns(client: &Client, node_ip: &str) -> anyhow::Result<()> {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run(client: Client, ca: Arc<CaState>, user_store: Arc<UserStore>) -> anyhow::Result<()> {
+pub async fn run(client: Client, ca: Arc<CaState>, user_store: Arc<UserStore>, auth_mode: AuthMode, byoidc_config: Option<ByoidcConfig>) -> anyhow::Result<()> {
     let tls_config = generate_tls_config(&ca)
         .map_err(|e| anyhow::anyhow!("failed to generate TLS config: {e}"))?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
-    if let Err(e) = setup_infrastructure(&client).await {
+    if let Err(e) = setup_infrastructure(&client, &auth_mode).await {
         warn!(%e, "failed to set up OAuth infrastructure (will retry on next restart)");
     }
 
-    let state = Arc::new(OAuthState::new(user_store));
+    let mode_label = match &auth_mode {
+        AuthMode::Legacy => "legacy (sha256~)",
+        AuthMode::Oidc => "oidc (JWT)",
+        AuthMode::Byoidc => "byoidc (external OIDC)",
+    };
+    info!(mode = mode_label, "OAuth auth mode");
+
+    let state = Arc::new(OAuthState::new(user_store, auth_mode, byoidc_config).await);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], OAUTH_PORT));
     let listener = TcpListener::bind(addr).await?;
