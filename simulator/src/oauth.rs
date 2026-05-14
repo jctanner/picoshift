@@ -1533,6 +1533,31 @@ async fn setup_infrastructure(client: &Client, auth_mode: &AuthMode) -> anyhow::
 
     patch_coredns(client, &node_ip, auth_mode).await?;
 
+    // Route in-cluster kubernetes service traffic through the ocp-shim (port 6443)
+    // so that OpenShift-specific APIs (projectrequests, etc.) and
+    // .well-known/oauth-authorization-server are available to in-cluster clients.
+    let ep_api: Api<Endpoints> = Api::namespaced(client.clone(), "default");
+    let ep = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Endpoints",
+        "metadata": { "name": "kubernetes" },
+        "subsets": [{
+            "addresses": [{ "ip": node_ip }],
+            "ports": [{ "name": "https", "port": 6443, "protocol": "TCP" }]
+        }]
+    });
+    match ep_api
+        .patch(
+            "kubernetes",
+            &PatchParams::apply("ocp-sim"),
+            &Patch::Apply(serde_json::from_value::<Endpoints>(ep)?),
+        )
+        .await
+    {
+        Ok(_) => info!("patched kubernetes endpoints to ocp-shim port 6443"),
+        Err(e) => warn!(%e, "failed to patch kubernetes endpoints"),
+    }
+
     Ok(())
 }
 
