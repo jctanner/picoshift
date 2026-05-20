@@ -18,6 +18,8 @@ pub(crate) async fn issue_auth_code(
     client_id: &str,
     redirect_uri: &str,
     req_state: &str,
+    code_challenge: Option<String>,
+    code_challenge_method: Option<String>,
 ) -> Response<Full<Bytes>> {
     let code = generate_random_string(32);
     state.codes.write().await.insert(
@@ -26,6 +28,8 @@ pub(crate) async fn issue_auth_code(
             username: username.to_string(),
             client_id: client_id.to_string(),
             created: Instant::now(),
+            code_challenge,
+            code_challenge_method,
         },
     );
 
@@ -64,6 +68,9 @@ pub(crate) async fn handle_authorize_get(
     let req_state = params.get("state").cloned().unwrap_or_default();
     let response_type = params.get("response_type").cloned().unwrap_or_default();
 
+    let code_challenge = params.get("code_challenge").cloned();
+    let code_challenge_method = params.get("code_challenge_method").cloned();
+
     let (_, redirect_uris) = match validate_client(client, &client_id).await {
         Some(c) => c,
         None => return text_response(StatusCode::BAD_REQUEST, "unknown client_id\n"),
@@ -86,7 +93,7 @@ pub(crate) async fn handle_authorize_get(
                     if let Some((user, pass)) = cred_str.split_once(':') {
                         if let Some(_entry) = state.user_store.authenticate(user, pass) {
                             ensure_user_and_identity(client, user).await;
-                            return issue_auth_code(state, user, &client_id, &redirect_uri, &req_state).await;
+                            return issue_auth_code(state, user, &client_id, &redirect_uri, &req_state, code_challenge.clone(), code_challenge_method.clone()).await;
                         }
                     }
                 }
@@ -151,13 +158,16 @@ pub(crate) async fn handle_authorize_post(
     }
 
     ensure_user_and_identity(client, &username).await;
-    issue_auth_code(state, &username, &client_id, &redirect_uri, &req_state).await
+    let code_challenge = params.get("code_challenge").cloned();
+    let code_challenge_method = params.get("code_challenge_method").cloned();
+    issue_auth_code(state, &username, &client_id, &redirect_uri, &req_state, code_challenge, code_challenge_method).await
 }
 
 pub(crate) async fn handle_token(
     client: &Client,
     state: &OAuthState,
     body: &[u8],
+    authorization: Option<&str>,
 ) -> Response<Full<Bytes>> {
     let params = parse_form_body(body);
 
@@ -175,13 +185,17 @@ pub(crate) async fn handle_token(
             return json_response(StatusCode::BAD_REQUEST, r#"{"error":"invalid_request","error_description":"missing code"}"#)
         }
     };
-    let client_id = match params.get("client_id") {
-        Some(id) => id.clone(),
-        None => {
-            return json_response(StatusCode::BAD_REQUEST, r#"{"error":"invalid_request","error_description":"missing client_id"}"#)
-        }
+
+    let client_id = if let Some(id) = params.get("client_id") {
+        id.clone()
+    } else if let Some(id) = extract_client_id_from_basic(authorization) {
+        id
+    } else {
+        return json_response(StatusCode::BAD_REQUEST, r#"{"error":"invalid_request","error_description":"missing client_id"}"#);
     };
+
     let client_secret = params.get("client_secret").cloned().unwrap_or_default();
+    let code_verifier = params.get("code_verifier").cloned();
 
     let auth_code = {
         let mut codes = state.codes.write().await;
@@ -201,18 +215,32 @@ pub(crate) async fn handle_token(
         return json_response(StatusCode::BAD_REQUEST, r#"{"error":"invalid_grant","error_description":"client_id mismatch"}"#);
     }
 
-    let (expected_secret, _) = match validate_client(client, &client_id).await {
-        Some(c) => c,
-        None => {
-            return json_response(StatusCode::BAD_REQUEST, r#"{"error":"invalid_client"}"#)
+    if let Some(challenge) = &auth_code.code_challenge {
+        match &code_verifier {
+            Some(verifier) => {
+                let method = auth_code.code_challenge_method.as_deref().unwrap_or("S256");
+                if !verify_pkce(verifier, challenge, method) {
+                    return json_response(StatusCode::BAD_REQUEST, r#"{"error":"invalid_grant","error_description":"code_verifier mismatch"}"#);
+                }
+            }
+            None => {
+                return json_response(StatusCode::BAD_REQUEST, r#"{"error":"invalid_request","error_description":"missing code_verifier"}"#);
+            }
         }
-    };
+    } else {
+        let (expected_secret, _) = match validate_client(client, &client_id).await {
+            Some(c) => c,
+            None => {
+                return json_response(StatusCode::BAD_REQUEST, r#"{"error":"invalid_client"}"#)
+            }
+        };
 
-    if !expected_secret.is_empty() && client_secret != expected_secret {
-        return json_response(
-            StatusCode::UNAUTHORIZED,
-            r#"{"error":"invalid_client","error_description":"bad client_secret"}"#,
-        );
+        if !expected_secret.is_empty() && client_secret != expected_secret {
+            return json_response(
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":"invalid_client","error_description":"bad client_secret"}"#,
+            );
+        }
     }
 
     let username = &auth_code.username;
@@ -362,6 +390,31 @@ pub(crate) async fn handle_userinfo(state: &OAuthState, req: &Request<Incoming>)
         })
         .to_string(),
     )
+}
+
+fn verify_pkce(verifier: &str, challenge: &str, method: &str) -> bool {
+    use base64::Engine;
+    match method {
+        "S256" => {
+            let digest = ring::digest::digest(&ring::digest::SHA256, verifier.as_bytes());
+            let computed = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.as_ref());
+            computed == challenge
+        }
+        "plain" => verifier == challenge,
+        _ => false,
+    }
+}
+
+fn extract_client_id_from_basic(authorization: Option<&str>) -> Option<String> {
+    let auth = authorization?;
+    let encoded = auth.strip_prefix("Basic ")?;
+    let decoded = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        encoded.trim(),
+    ).ok()?;
+    let cred_str = std::str::from_utf8(&decoded).ok()?;
+    let (user, _) = cred_str.split_once(':')?;
+    Some(user.to_string())
 }
 
 pub(crate) fn is_cli_auth_request(req: &Request<Incoming>) -> bool {

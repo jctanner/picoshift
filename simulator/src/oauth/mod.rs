@@ -93,7 +93,7 @@ async fn handle_request(
             if is_byoidc {
                 Ok(handle_byoidc_token(&client, &state, &body).await)
             } else {
-                Ok(handle_token(&client, &state, &body).await)
+                Ok(handle_token(&client, &state, &body, authorization.as_deref()).await)
             }
         }
         _ if is_byoidc

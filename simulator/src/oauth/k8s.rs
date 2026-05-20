@@ -34,7 +34,7 @@ pub(crate) async fn validate_client(
 }
 
 pub(crate) async fn ensure_user_and_identity(client: &Client, username: &str) {
-    let identity_name = format!("ocp-sim:{username}");
+    let identity_name = format!("ocp-sim.{username}");
 
     let user_ar = user_ar();
     let users: Api<DynamicObject> = Api::all_with(client.clone(), &user_ar);

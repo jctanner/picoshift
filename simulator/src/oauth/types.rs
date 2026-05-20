@@ -159,6 +159,8 @@ pub(crate) struct AuthCode {
     pub(crate) username: String,
     pub(crate) client_id: String,
     pub(crate) created: Instant,
+    pub(crate) code_challenge: Option<String>,
+    pub(crate) code_challenge_method: Option<String>,
 }
 
 pub(crate) struct TokenInfo {
