@@ -158,13 +158,11 @@ impl JwtKeys {
 pub(crate) struct AuthCode {
     pub(crate) username: String,
     pub(crate) client_id: String,
-    pub(crate) _redirect_uri: String,
     pub(crate) created: Instant,
 }
 
 pub(crate) struct TokenInfo {
     pub(crate) username: String,
-    pub(crate) _client_id: String,
     pub(crate) created: Instant,
 }
 

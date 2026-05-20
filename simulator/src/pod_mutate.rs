@@ -21,8 +21,6 @@ use kube::runtime::controller::Action;
 use kube::runtime::watcher;
 use kube::runtime::Controller;
 use kube::{Client, ResourceExt};
-use rcgen::{CertificateParams, Issuer, KeyPair};
-use rustls::ServerConfig;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
@@ -49,43 +47,6 @@ fn uid_range_for_namespace(name: &str) -> u64 {
     1_000_000_000 + block * 10_000
 }
 
-fn generate_tls_config(
-    ca: &CaState,
-    node_ip: &str,
-) -> Result<ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let cn = "ocp-sim-webhook.ocp-sim.svc";
-    let ca_key = KeyPair::from_pem(&ca.ca_key_pem)?;
-    let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params.distinguished_name.push(
-        rcgen::DnType::CommonName,
-        rcgen::DnValue::Utf8String("ocp-sim-service-ca".into()),
-    );
-    let issuer = Issuer::from_params(&ca_params, &ca_key);
-
-    let mut params = CertificateParams::new(vec![cn.to_string(), node_ip.to_string()])?;
-    params.distinguished_name.push(
-        rcgen::DnType::CommonName,
-        rcgen::DnValue::Utf8String(cn.into()),
-    );
-
-    let key_pair = KeyPair::generate()?;
-    let cert = params.signed_by(&key_pair, &issuer)?;
-
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-
-    let certs =
-        rustls_pemfile::certs(&mut cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
-        .ok_or("no private key found")?;
-
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-
-    Ok(config)
-}
 
 fn build_admission_response(uid: &str, patch: Option<Vec<serde_json::Value>>) -> serde_json::Value {
     let mut response = serde_json::json!({
@@ -204,23 +165,7 @@ async fn handle_request(
         .unwrap())
 }
 
-async fn get_node_ip(client: &Client) -> anyhow::Result<String> {
-    use k8s_openapi::api::core::v1::Node;
-    let nodes: Api<Node> = Api::all(client.clone());
-    let node_list = nodes.list(&Default::default()).await?;
-    for node in node_list {
-        if let Some(status) = node.status {
-            if let Some(addresses) = status.addresses {
-                for addr in addresses {
-                    if addr.type_ == "InternalIP" {
-                        return Ok(addr.address);
-                    }
-                }
-            }
-        }
-    }
-    anyhow::bail!("no node with InternalIP found")
-}
+use crate::util::{get_node_ip, sign_tls_config};
 
 async fn setup_webhook_with_ip(client: &Client, ca: &CaState, node_ip: &str) -> anyhow::Result<()> {
     let ca_bundle = base64::engine::general_purpose::STANDARD.encode(ca.ca_cert_pem.as_bytes());
@@ -344,7 +289,8 @@ fn error_policy_ns(
 pub async fn run(client: Client, ca: Arc<CaState>) -> anyhow::Result<()> {
     let node_ip = get_node_ip(&client).await?;
 
-    let tls_config = generate_tls_config(&ca, &node_ip)
+    let cn = "ocp-sim-webhook.ocp-sim.svc";
+    let tls_config = sign_tls_config(&ca, &[cn, &node_ip])
         .map_err(|e| anyhow::anyhow!("failed to generate webhook TLS config: {e}"))?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 

@@ -2,22 +2,14 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Namespace;
-use kube::api::{Api, ApiResource, DynamicObject, ObjectMeta, Patch, PatchParams, PostParams};
+use kube::api::{Api, DynamicObject, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::runtime::controller::Action;
 use kube::runtime::watcher;
 use kube::runtime::Controller;
 use kube::{Client, ResourceExt};
 use tracing::{info, warn};
 
-fn project_ar() -> ApiResource {
-    ApiResource {
-        group: "project.openshift.io".into(),
-        version: "v1".into(),
-        api_version: "project.openshift.io/v1".into(),
-        kind: "Project".into(),
-        plural: "projects".into(),
-    }
-}
+use crate::util::project_ar;
 
 async fn reconcile_namespace(
     ns: Arc<Namespace>,

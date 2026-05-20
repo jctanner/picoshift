@@ -1,22 +1,14 @@
-use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
+use kube::api::{Api, DynamicObject, Patch, PatchParams};
 use kube::Client;
 use tracing::{info, warn};
 
-pub(crate) fn oauth_client_api_resource() -> ApiResource {
-    ApiResource {
-        group: "oauth.openshift.io".into(),
-        version: "v1".into(),
-        api_version: "oauth.openshift.io/v1".into(),
-        kind: "OAuthClient".into(),
-        plural: "oauthclients".into(),
-    }
-}
+use crate::util::{oauth_client_ar, user_ar, identity_ar};
 
 pub(crate) async fn validate_client(
     client: &Client,
     client_id: &str,
 ) -> Option<(String, Vec<String>)> {
-    let ar = oauth_client_api_resource();
+    let ar = oauth_client_ar();
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
     let oauth_client = api.get(client_id).await.ok()?;
 
@@ -41,30 +33,10 @@ pub(crate) async fn validate_client(
     Some((secret, redirect_uris))
 }
 
-fn user_api_resource() -> ApiResource {
-    ApiResource {
-        group: "user.openshift.io".into(),
-        version: "v1".into(),
-        api_version: "user.openshift.io/v1".into(),
-        kind: "User".into(),
-        plural: "users".into(),
-    }
-}
-
-fn identity_api_resource() -> ApiResource {
-    ApiResource {
-        group: "user.openshift.io".into(),
-        version: "v1".into(),
-        api_version: "user.openshift.io/v1".into(),
-        kind: "Identity".into(),
-        plural: "identities".into(),
-    }
-}
-
 pub(crate) async fn ensure_user_and_identity(client: &Client, username: &str) {
     let identity_name = format!("ocp-sim:{username}");
 
-    let user_ar = user_api_resource();
+    let user_ar = user_ar();
     let users: Api<DynamicObject> = Api::all_with(client.clone(), &user_ar);
     let user_obj = serde_json::json!({
         "apiVersion": "user.openshift.io/v1",
@@ -87,7 +59,7 @@ pub(crate) async fn ensure_user_and_identity(client: &Client, username: &str) {
             let uid = u.metadata.uid.as_deref().unwrap_or("unknown");
             info!(username, uid, "ensured User object");
 
-            let id_ar = identity_api_resource();
+            let id_ar = identity_ar();
             let identities: Api<DynamicObject> = Api::all_with(client.clone(), &id_ar);
             let id_obj = serde_json::json!({
                 "apiVersion": "user.openshift.io/v1",

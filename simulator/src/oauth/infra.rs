@@ -4,13 +4,13 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams, PostParams};
+use kube::api::{Api, DynamicObject, Patch, PatchParams, PostParams};
 use kube::Client;
-use rcgen::{CertificateParams, Issuer, KeyPair};
 use rustls::ServerConfig;
 use tracing::{info, warn};
 
 use crate::{AuthMode, CaState};
+use crate::util::{get_node_ip, route_ar, sign_tls_config};
 
 use super::types::{DOMAIN, OAUTH_HOST, OAUTH_NS, OAUTH_PORT};
 
@@ -18,34 +18,8 @@ pub(crate) fn generate_tls_config(
     ca: &CaState,
 ) -> Result<ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
     let cn = format!("{OAUTH_HOST}.{DOMAIN}");
-    let ca_key = KeyPair::from_pem(&ca.ca_key_pem)?;
-    let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let issuer = Issuer::from_params(&ca_params, &ca_key);
-
     let entra_host = format!("entra.{DOMAIN}");
-    let mut params = CertificateParams::new(vec![cn.clone(), entra_host])?;
-    params.distinguished_name.push(
-        rcgen::DnType::CommonName,
-        rcgen::DnValue::Utf8String(cn.clone()),
-    );
-
-    let key_pair = KeyPair::generate()?;
-    let cert = params.signed_by(&key_pair, &issuer)?;
-
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-
-    let certs = rustls_pemfile::certs(&mut cert_pem.as_bytes())
-        .collect::<Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
-        .ok_or("no private key found")?;
-
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-
-    Ok(config)
+    sign_tls_config(ca, &[&cn, &entra_host])
 }
 
 pub(crate) async fn setup_infrastructure(
@@ -83,13 +57,7 @@ pub(crate) async fn setup_infrastructure(
             Err(e) => warn!(%e, "failed to delete leftover endpoints {OAUTH_HOST}"),
         }
         {
-            let ar = ApiResource {
-                group: "route.openshift.io".into(),
-                version: "v1".into(),
-                api_version: "route.openshift.io/v1".into(),
-                kind: "Route".into(),
-                plural: "routes".into(),
-            };
+            let ar = route_ar();
             let routes: Api<DynamicObject> =
                 Api::namespaced_with(client.clone(), OAUTH_NS, &ar);
             match routes.delete(OAUTH_HOST, &Default::default()).await {
@@ -253,36 +221,13 @@ pub(crate) async fn setup_infrastructure(
     Ok(())
 }
 
-async fn get_node_ip(client: &Client) -> anyhow::Result<String> {
-    use k8s_openapi::api::core::v1::Node;
-    let nodes: Api<Node> = Api::all(client.clone());
-    let node_list = nodes.list(&Default::default()).await?;
-    for node in node_list {
-        if let Some(status) = node.status {
-            if let Some(addresses) = status.addresses {
-                for addr in addresses {
-                    if addr.type_ == "InternalIP" {
-                        return Ok(addr.address);
-                    }
-                }
-            }
-        }
-    }
-    anyhow::bail!("no node with InternalIP found")
-}
 
 async fn create_oauth_route(
     client: &Client,
     host: &str,
     svc_name: &str,
 ) -> anyhow::Result<()> {
-    let ar = ApiResource {
-        group: "route.openshift.io".into(),
-        version: "v1".into(),
-        api_version: "route.openshift.io/v1".into(),
-        kind: "Route".into(),
-        plural: "routes".into(),
-    };
+    let ar = route_ar();
     let routes: Api<DynamicObject> = Api::namespaced_with(client.clone(), OAUTH_NS, &ar);
 
     let route_name = host.split('.').next().unwrap_or(host);

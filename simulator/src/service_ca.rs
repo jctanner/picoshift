@@ -14,39 +14,13 @@ use kube::runtime::controller::Action;
 use kube::runtime::Controller;
 use kube::runtime::watcher;
 use kube::{Client, ResourceExt};
-use rcgen::{CertificateParams, Issuer, KeyPair};
 use tracing::{info, warn};
 
 use crate::CaState;
+use crate::util::sign_cert;
 
 const SERVING_CERT_ANNOTATION: &str = "service.beta.openshift.io/serving-cert-secret-name";
 const INJECT_CABUNDLE_ANNOTATION: &str = "service.beta.openshift.io/inject-cabundle";
-
-fn generate_serving_cert(
-    ca: &CaState,
-    cn: &str,
-) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-    let ca_key = KeyPair::from_pem(&ca.ca_key_pem)?;
-    let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params.distinguished_name.push(
-        rcgen::DnType::CommonName,
-        rcgen::DnValue::Utf8String("ocp-sim-service-ca".into()),
-    );
-    let issuer = Issuer::from_params(&ca_params, &ca_key);
-
-    let fqdn = format!("{cn}.cluster.local");
-    let mut params = CertificateParams::new(vec![cn.to_string(), fqdn])?;
-    params.distinguished_name.push(
-        rcgen::DnType::CommonName,
-        rcgen::DnValue::Utf8String(cn.into()),
-    );
-
-    let key_pair = KeyPair::generate()?;
-    let cert = params.signed_by(&key_pair, &issuer)?;
-
-    Ok((cert.pem(), key_pair.serialize_pem()))
-}
 
 async fn reconcile_service(
     svc: Arc<Service>,
@@ -79,7 +53,8 @@ async fn reconcile_service(
     }
 
     let cn = format!("{svc_name}.{ns}.svc");
-    let (cert_pem, key_pem) = match generate_serving_cert(ca, &cn) {
+    let fqdn = format!("{cn}.cluster.local");
+    let (cert_pem, key_pem) = match sign_cert(ca, &[&cn, &fqdn]) {
         Ok(pair) => pair,
         Err(e) => {
             warn!(%e, ns, svc_name, "failed to generate serving cert");

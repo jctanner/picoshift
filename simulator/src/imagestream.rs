@@ -1,22 +1,14 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
+use kube::api::{Api, DynamicObject, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::watcher;
 use kube::runtime::Controller;
 use kube::{Client, ResourceExt};
 use tracing::{info, warn};
 
-fn imagestream_ar() -> ApiResource {
-    ApiResource {
-        group: "image.openshift.io".into(),
-        version: "v1".into(),
-        api_version: "image.openshift.io/v1".into(),
-        kind: "ImageStream".into(),
-        plural: "imagestreams".into(),
-    }
-}
+use crate::util::imagestream_ar;
 
 fn status_needs_update(is: &DynamicObject) -> bool {
     let spec_tags = is

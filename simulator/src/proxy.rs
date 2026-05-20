@@ -9,22 +9,22 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use k8s_openapi::api::core::v1::{Endpoints, Service};
-use kube::api::{Api, ApiResource, DynamicObject};
+use kube::api::{Api, DynamicObject};
 use kube::runtime::watcher;
 use kube::runtime::WatchStreamExt;
 use kube::{Client, ResourceExt};
-use rcgen::{CertificateParams, Issuer, KeyPair};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, ServerConfig, SignatureScheme};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 use crate::CaState;
+use crate::util::{route_ar, httproute_ar, gateway_ar, sign_tls_config};
 
 struct RouteBackend {
     service_name: String,
@@ -96,16 +96,6 @@ fn make_tls_config() -> ClientConfig {
 
 type RouteTable = Arc<RwLock<HashMap<String, RouteBackend>>>;
 
-fn route_api_resource() -> ApiResource {
-    ApiResource {
-        group: "route.openshift.io".into(),
-        version: "v1".into(),
-        api_version: "route.openshift.io/v1".into(),
-        kind: "Route".into(),
-        plural: "routes".into(),
-    }
-}
-
 fn extract_host(route: &DynamicObject) -> Option<String> {
     route
         .data
@@ -150,7 +140,7 @@ fn extract_backend(route: &DynamicObject) -> Option<(String, TargetPort, bool)> 
 }
 
 async fn build_route_table(client: Client, table: RouteTable) {
-    let ar = route_api_resource();
+    let ar = route_ar();
     let routes: Api<DynamicObject> = Api::all_with(client, &ar);
 
     let stream = watcher::watcher(routes, watcher::Config::default())
@@ -191,28 +181,8 @@ async fn build_route_table(client: Client, table: RouteTable) {
     }
 }
 
-fn httproute_api_resource() -> ApiResource {
-    ApiResource {
-        group: "gateway.networking.k8s.io".into(),
-        version: "v1".into(),
-        api_version: "gateway.networking.k8s.io/v1".into(),
-        kind: "HTTPRoute".into(),
-        plural: "httproutes".into(),
-    }
-}
-
-fn gateway_api_resource() -> ApiResource {
-    ApiResource {
-        group: "gateway.networking.k8s.io".into(),
-        version: "v1".into(),
-        api_version: "gateway.networking.k8s.io/v1".into(),
-        kind: "Gateway".into(),
-        plural: "gateways".into(),
-    }
-}
-
 async fn build_gateway_route_table(client: Client, table: RouteTable) {
-    let ar = httproute_api_resource();
+    let ar = httproute_ar();
     let routes: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
 
     let stream = watcher::watcher(routes, watcher::Config::default())
@@ -259,7 +229,7 @@ async fn build_gateway_route_table(client: Client, table: RouteTable) {
 
                     let mut all_hosts = hostnames.clone();
                     if all_hosts.is_empty() {
-                        let gw_ar = gateway_api_resource();
+                        let gw_ar = gateway_ar();
                         let gw_api: Api<DynamicObject> =
                             Api::namespaced_with(client.clone(), &gw_ns, &gw_ar);
                         if let Ok(gw) = gw_api.get(&gw_name).await {
@@ -435,17 +405,12 @@ where
             .unwrap());
     }
 
+    let mut buf_upstream = tokio::io::BufReader::with_capacity(4096, upstream);
     let mut resp_buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 1];
     loop {
-        match upstream.read(&mut tmp).await {
-            Ok(0) => break,
-            Ok(_) => {
-                resp_buf.push(tmp[0]);
-                if resp_buf.len() >= 4 && &resp_buf[resp_buf.len()-4..] == b"\r\n\r\n" {
-                    break;
-                }
-            }
+        let available = match buf_upstream.fill_buf().await {
+            Ok(b) if b.is_empty() => break,
+            Ok(b) => b,
             Err(e) => {
                 warn!("upstream read failed: {e}");
                 return Ok(Response::builder()
@@ -453,6 +418,12 @@ where
                     .body(Full::new(Bytes::from("upstream read failed\n")))
                     .unwrap());
             }
+        };
+        resp_buf.extend_from_slice(available);
+        let consumed = available.len();
+        buf_upstream.consume(consumed);
+        if resp_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
         }
     }
 
@@ -489,7 +460,7 @@ where
             Ok(upgraded) => {
                 let mut client_io = hyper_util::rt::TokioIo::new(upgraded);
                 let (mut cr, mut cw) = tokio::io::split(&mut client_io);
-                let (mut ur, mut uw) = tokio::io::split(&mut upstream);
+                let (mut ur, mut uw) = tokio::io::split(&mut buf_upstream);
                 let c2u = tokio::io::copy(&mut cr, &mut uw);
                 let u2c = tokio::io::copy(&mut ur, &mut cw);
                 tokio::select! {
@@ -711,37 +682,6 @@ async fn proxy_request(
     }
 }
 
-fn generate_tls_config(ca: &CaState) -> Result<ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let cn = "*.apps.ocp-sim.test";
-    let ca_key = KeyPair::from_pem(&ca.ca_key_pem)?;
-    let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let issuer = Issuer::from_params(&ca_params, &ca_key);
-
-    let mut params = CertificateParams::new(vec![cn.to_string()])?;
-    params.distinguished_name.push(
-        rcgen::DnType::CommonName,
-        rcgen::DnValue::Utf8String(cn.to_string()),
-    );
-
-    let key_pair = KeyPair::generate()?;
-    let cert = params.signed_by(&key_pair, &issuer)?;
-
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-
-    let certs = rustls_pemfile::certs(&mut cert_pem.as_bytes())
-        .collect::<Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
-        .ok_or("no private key found")?;
-
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-
-    Ok(config)
-}
-
 pub async fn run(client: Client, port: u16, ca: Arc<CaState>) -> anyhow::Result<()> {
     let table: RouteTable = Arc::new(RwLock::new(HashMap::new()));
 
@@ -763,7 +703,7 @@ pub async fn run(client: Client, port: u16, ca: Arc<CaState>) -> anyhow::Result<
     info!(%addr, "reverse proxy listening (HTTP)");
 
     // HTTPS listener on port 443
-    let tls_config = generate_tls_config(&ca)
+    let tls_config = sign_tls_config(&ca, &["*.apps.ocp-sim.test"])
         .map_err(|e| anyhow::anyhow!("failed to generate proxy TLS config: {e}"))?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let tls_addr = SocketAddr::from(([0, 0, 0, 0], 443));

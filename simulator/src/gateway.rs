@@ -9,12 +9,14 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{Api, ApiResource, DynamicObject, ObjectMeta, Patch, PatchParams, PostParams};
+use kube::api::{Api, DynamicObject, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::runtime::controller::Action;
 use kube::runtime::watcher;
 use kube::runtime::Controller;
 use kube::{Client, ResourceExt};
 use tracing::{info, warn};
+
+use crate::util::{gateway_class_ar, gateway_ar, httproute_ar, destination_rule_ar};
 
 const CONTROLLER_NAME: &str = "openshift.io/gateway-controller/v1";
 const GATEWAY_NS: &str = "openshift-ingress";
@@ -27,36 +29,6 @@ const KUBE_AUTH_PROXY_PORT: u16 = 8443;
 const ENVOY_LISTEN_PORT: i32 = 8443;
 const SERVICE_PORT: i32 = 443;
 const TLS_SECRET_NAME: &str = "data-science-gateway-service-tls";
-
-fn gateway_class_ar() -> ApiResource {
-    ApiResource {
-        group: "gateway.networking.k8s.io".into(),
-        version: "v1".into(),
-        api_version: "gateway.networking.k8s.io/v1".into(),
-        kind: "GatewayClass".into(),
-        plural: "gatewayclasses".into(),
-    }
-}
-
-fn gateway_ar() -> ApiResource {
-    ApiResource {
-        group: "gateway.networking.k8s.io".into(),
-        version: "v1".into(),
-        api_version: "gateway.networking.k8s.io/v1".into(),
-        kind: "Gateway".into(),
-        plural: "gateways".into(),
-    }
-}
-
-fn httproute_ar() -> ApiResource {
-    ApiResource {
-        group: "gateway.networking.k8s.io".into(),
-        version: "v1".into(),
-        api_version: "gateway.networking.k8s.io/v1".into(),
-        kind: "HTTPRoute".into(),
-        plural: "httproutes".into(),
-    }
-}
 
 fn service_full_name(gateway_name: &str, class_name: &str) -> String {
     format!("{gateway_name}-{class_name}")
@@ -330,16 +302,6 @@ fn generate_rds_yaml(hostname: &str, routes: &[HttpRouteRule]) -> String {
     routes:
 {route_entries}"#,
     )
-}
-
-fn destination_rule_ar() -> ApiResource {
-    ApiResource {
-        group: "networking.istio.io".into(),
-        version: "v1".into(),
-        api_version: "networking.istio.io/v1".into(),
-        kind: "DestinationRule".into(),
-        plural: "destinationrules".into(),
-    }
 }
 
 fn extract_tls_ports(dr: &DynamicObject) -> std::collections::HashSet<u16> {

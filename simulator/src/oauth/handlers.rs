@@ -25,7 +25,6 @@ pub(crate) async fn issue_auth_code(
         AuthCode {
             username: username.to_string(),
             client_id: client_id.to_string(),
-            _redirect_uri: redirect_uri.to_string(),
             created: Instant::now(),
         },
     );
@@ -258,7 +257,6 @@ pub(crate) async fn handle_token(
         token.clone(),
         TokenInfo {
             username: auth_code.username.clone(),
-            _client_id: client_id,
             created: Instant::now(),
         },
     );

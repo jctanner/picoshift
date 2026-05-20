@@ -8,6 +8,7 @@ mod project;
 mod proxy;
 mod route;
 mod service_ca;
+pub mod util;
 
 use std::sync::Arc;
 
@@ -128,40 +129,27 @@ async fn main() -> anyhow::Result<()> {
     let is_handle = tokio::spawn(imagestream::run(client.clone()));
     let lb_handle = tokio::spawn(loadbalancer::run(client.clone()));
 
-    if args.proxy {
+    let proxy_handle = if args.proxy {
         info!(port = args.proxy_port, "starting reverse proxy");
-        let proxy_handle = tokio::spawn(proxy::run(client.clone(), args.proxy_port, ca.clone()));
-
-        tokio::select! {
-            res = route_handle => if let Ok(Err(e)) = res { error!(%e, "route controller failed"); },
-            res = svc_handle => if let Ok(Err(e)) = res { error!(%e, "service-ca controller failed"); },
-            res = cm_handle => if let Ok(Err(e)) = res { error!(%e, "configmap ca-inject controller failed"); },
-            res = mwc_handle => if let Ok(Err(e)) = res { error!(%e, "mutating-webhook ca-inject controller failed"); },
-            res = vwc_handle => if let Ok(Err(e)) = res { error!(%e, "validating-webhook ca-inject controller failed"); },
-            res = gw_handle => if let Ok(Err(e)) = res { error!(%e, "gateway controller failed"); },
-            res = oauth_handle => if let Ok(Err(e)) = res { error!(%e, "oauth server failed"); },
-            res = proj_handle => if let Ok(Err(e)) = res { error!(%e, "project controller failed"); },
-            res = scc_handle => if let Ok(Err(e)) = res { error!(%e, "scc webhook failed"); },
-            res = jobset_handle => if let Ok(Err(e)) = res { error!(%e, "jobset controller failed"); },
-            res = is_handle => if let Ok(Err(e)) = res { error!(%e, "imagestream controller failed"); },
-            res = lb_handle => if let Ok(Err(e)) = res { error!(%e, "loadbalancer controller failed"); },
-            res = proxy_handle => if let Ok(Err(e)) = res { error!(%e, "proxy failed"); },
-        }
+        tokio::spawn(proxy::run(client.clone(), args.proxy_port, ca.clone()))
     } else {
-        tokio::select! {
-            res = route_handle => if let Ok(Err(e)) = res { error!(%e, "route controller failed"); },
-            res = svc_handle => if let Ok(Err(e)) = res { error!(%e, "service-ca controller failed"); },
-            res = cm_handle => if let Ok(Err(e)) = res { error!(%e, "configmap ca-inject controller failed"); },
-            res = mwc_handle => if let Ok(Err(e)) = res { error!(%e, "mutating-webhook ca-inject controller failed"); },
-            res = vwc_handle => if let Ok(Err(e)) = res { error!(%e, "validating-webhook ca-inject controller failed"); },
-            res = gw_handle => if let Ok(Err(e)) = res { error!(%e, "gateway controller failed"); },
-            res = oauth_handle => if let Ok(Err(e)) = res { error!(%e, "oauth server failed"); },
-            res = proj_handle => if let Ok(Err(e)) = res { error!(%e, "project controller failed"); },
-            res = scc_handle => if let Ok(Err(e)) = res { error!(%e, "scc webhook failed"); },
-            res = jobset_handle => if let Ok(Err(e)) = res { error!(%e, "jobset controller failed"); },
-            res = is_handle => if let Ok(Err(e)) = res { error!(%e, "imagestream controller failed"); },
-            res = lb_handle => if let Ok(Err(e)) = res { error!(%e, "loadbalancer controller failed"); },
-        }
+        tokio::spawn(std::future::pending())
+    };
+
+    tokio::select! {
+        res = route_handle => if let Ok(Err(e)) = res { error!(%e, "route controller failed"); },
+        res = svc_handle => if let Ok(Err(e)) = res { error!(%e, "service-ca controller failed"); },
+        res = cm_handle => if let Ok(Err(e)) = res { error!(%e, "configmap ca-inject controller failed"); },
+        res = mwc_handle => if let Ok(Err(e)) = res { error!(%e, "mutating-webhook ca-inject controller failed"); },
+        res = vwc_handle => if let Ok(Err(e)) = res { error!(%e, "validating-webhook ca-inject controller failed"); },
+        res = gw_handle => if let Ok(Err(e)) = res { error!(%e, "gateway controller failed"); },
+        res = oauth_handle => if let Ok(Err(e)) = res { error!(%e, "oauth server failed"); },
+        res = proj_handle => if let Ok(Err(e)) = res { error!(%e, "project controller failed"); },
+        res = scc_handle => if let Ok(Err(e)) = res { error!(%e, "scc webhook failed"); },
+        res = jobset_handle => if let Ok(Err(e)) = res { error!(%e, "jobset controller failed"); },
+        res = is_handle => if let Ok(Err(e)) = res { error!(%e, "imagestream controller failed"); },
+        res = lb_handle => if let Ok(Err(e)) = res { error!(%e, "loadbalancer controller failed"); },
+        res = proxy_handle => if let Ok(Err(e)) = res { error!(%e, "proxy failed"); },
     }
 
     Ok(())

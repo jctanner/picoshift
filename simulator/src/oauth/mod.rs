@@ -141,6 +141,33 @@ pub async fn run(
 
     let state = Arc::new(OAuthState::new(user_store, auth_mode, byoidc_config).await);
 
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                let code_ttl = std::time::Duration::from_secs(300);
+                let token_ttl = std::time::Duration::from_secs(86400);
+                let codes_removed = {
+                    let mut codes = state.codes.write().await;
+                    let before = codes.len();
+                    codes.retain(|_, v| v.created.elapsed() < code_ttl);
+                    before - codes.len()
+                };
+                let tokens_removed = {
+                    let mut tokens = state.tokens.write().await;
+                    let before = tokens.len();
+                    tokens.retain(|_, v| v.created.elapsed() < token_ttl);
+                    before - tokens.len()
+                };
+                if codes_removed > 0 || tokens_removed > 0 {
+                    info!(codes_removed, tokens_removed, "evicted expired oauth entries");
+                }
+            }
+        });
+    }
+
     let addr = SocketAddr::from(([0, 0, 0, 0], OAUTH_PORT));
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "mock OAuth server listening (HTTPS)");

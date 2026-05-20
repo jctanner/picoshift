@@ -1,24 +1,16 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
+use kube::api::{Api, DynamicObject, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::watcher;
 use kube::runtime::Controller;
 use kube::{Client, ResourceExt};
 use tracing::{info, warn};
 
-const DOMAIN: &str = "apps.ocp-sim.test";
+use crate::util::route_ar;
 
-fn route_api_resource() -> ApiResource {
-    ApiResource {
-        group: "route.openshift.io".into(),
-        version: "v1".into(),
-        api_version: "route.openshift.io/v1".into(),
-        kind: "Route".into(),
-        plural: "routes".into(),
-    }
-}
+const DOMAIN: &str = "apps.ocp-sim.test";
 
 fn is_admitted(route: &DynamicObject) -> bool {
     route
@@ -71,7 +63,7 @@ async fn reconcile_route(
     if !is_admitted(&route) {
         let now = chrono::Utc::now().to_rfc3339();
 
-        let ar = route_api_resource();
+        let ar = route_ar();
         let routes: Api<DynamicObject> = Api::namespaced_with(ctx.as_ref().clone(), &ns, &ar);
 
         let status_patch = serde_json::json!({
@@ -112,7 +104,7 @@ fn error_policy(
 }
 
 pub async fn run(client: Client) -> Result<(), kube::Error> {
-    let ar = route_api_resource();
+    let ar = route_ar();
     let routes: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
     let ctx = Arc::new(client);
 

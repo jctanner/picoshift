@@ -4,22 +4,14 @@ use futures::StreamExt;
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::PodTemplateSpec;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams, PostParams};
+use kube::api::{Api, DynamicObject, Patch, PatchParams, PostParams};
 use kube::runtime::controller::Action;
 use kube::runtime::watcher;
 use kube::runtime::Controller;
 use kube::{Client, ResourceExt};
 use tracing::{info, warn};
 
-fn jobset_api_resource() -> ApiResource {
-    ApiResource {
-        group: "jobset.x-k8s.io".into(),
-        version: "v1alpha2".into(),
-        api_version: "jobset.x-k8s.io/v1alpha2".into(),
-        kind: "JobSet".into(),
-        plural: "jobsets".into(),
-    }
-}
+use crate::util::jobset_ar;
 
 async fn reconcile_jobset(
     js: Arc<DynamicObject>,
@@ -162,7 +154,7 @@ async fn reconcile_jobset(
         }
     }
 
-    let ar = jobset_api_resource();
+    let ar = jobset_ar();
     let js_api: Api<DynamicObject> = Api::namespaced_with(ctx.as_ref().clone(), &ns, &ar);
 
     if succeeded_jobs + failed_jobs == total_jobs && total_jobs > 0 {
@@ -224,7 +216,7 @@ fn error_policy(
 }
 
 pub async fn run(client: Client) -> Result<(), kube::Error> {
-    let ar = jobset_api_resource();
+    let ar = jobset_ar();
     let jobsets: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
     let ctx = Arc::new(client);
 

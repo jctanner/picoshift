@@ -1,27 +1,12 @@
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{Node, Service};
+use k8s_openapi::api::core::v1::Service;
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::watcher;
 use kube::runtime::WatchStreamExt;
 use kube::{Client, ResourceExt};
 use tracing::{info, warn};
 
-async fn get_node_ip(client: &Client) -> anyhow::Result<String> {
-    let nodes: Api<Node> = Api::all(client.clone());
-    let node_list = nodes.list(&Default::default()).await?;
-    for node in node_list {
-        if let Some(status) = node.status {
-            if let Some(addresses) = status.addresses {
-                for addr in addresses {
-                    if addr.type_ == "InternalIP" {
-                        return Ok(addr.address);
-                    }
-                }
-            }
-        }
-    }
-    anyhow::bail!("no node with InternalIP found")
-}
+use crate::util::get_node_ip;
 
 fn needs_ip(svc: &Service) -> bool {
     let is_lb = svc
