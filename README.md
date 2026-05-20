@@ -152,7 +152,7 @@ The original design goals and scope are documented in
 ### ocp-sim controllers
 
 - **Route** — watches `route.openshift.io/v1` Routes, stamps `.status.ingress` with the admitted hostname
-- **Auth server** — serves `/oauth/authorize` (login form + Basic Auth challenge for `oc login`) and `/oauth/token`; authenticates against `users.yaml`, creates `User` and `Identity` API objects on first login, and returns per-user groups via `/oauth/userinfo`. In BYOIDC mode, proxies authorize/token/JWKS requests to the external OIDC provider (entra-mock)
+- **Auth server** — serves `/oauth/authorize` (login form + Basic Auth challenge for `oc login`) and `/oauth/token`; authenticates against `deploy/users.yaml`, creates `User` and `Identity` API objects on first login, and returns per-user groups via `/oauth/userinfo`. In BYOIDC mode, proxies authorize/token/JWKS requests to the external OIDC provider (entra-mock)
 - **Project** — mirrors every Namespace as a `project.openshift.io/v1` Project
 - **Service CA** — injects TLS certificates into annotated Services and their corresponding Secrets
 - **SCC Webhook** — mutating admission webhook that injects `fsGroup` into pods with `runAsNonRoot: true`, mimicking OCP's restricted SCC; also annotates namespaces with UID ranges
@@ -187,8 +187,8 @@ In BYOIDC mode, the auth server acts as a thin proxy between the browser/CLI and
 ## Quick start
 
 ```bash
-# Clone with submodules / place source dependencies in example.src/
-# (kind fork, opendatahub-operator, odh-dashboard)
+# Clone required dependencies (kind fork, opendatahub-operator, entra-id-emulator)
+make init-deps
 
 # Build everything and bring up the cluster (legacy auth)
 make all
@@ -205,7 +205,7 @@ make operator-install
 # Create a test workbench
 make workbench
 
-# Log in via CLI (default users defined in users.yaml)
+# Log in via CLI (default users defined in deploy/users.yaml)
 oc login --username=admin --password=admin
 
 # Open the dashboard (browser login form)
@@ -252,11 +252,30 @@ make workbench WORKBENCH_PROJECT=myproj WORKBENCH_NAME=wb1 WORKBENCH_IMAGE=jupyt
 
 ```
 picoshift/
-├── crds/                 # OpenShift, OLM, Gateway API, Istio, monitoring CRDs
-├── seed/                 # Cluster seed resources (ClusterVersion, SCCs, etc.)
+├── deploy/               # Everything needed to stand up the cluster
+│   ├── crds/                 # OpenShift, OLM, Gateway API, Istio, monitoring CRDs
+│   ├── seed/                 # Cluster seed resources (ClusterVersion, SCCs, etc.)
+│   ├── kind/                 # kind cluster config
+│   ├── users.yaml            # Default OAuth users (admin, user1, developer)
+│   ├── simulator.yaml        # ocp-sim DaemonSet
+│   ├── entra-mock.yaml       # Entra ID mock OIDC provider
+│   ├── seaweedfs.yaml        # Object storage for model serving
+│   └── sklearn-*.yaml        # Model serving examples
+├── docs/                 # All documentation
+│   ├── bugs/                 # Documented upstream ODH bugs found during testing
+│   ├── reviews/              # Code reviews
+│   ├── tasks/                # Task tracking docs
+│   ├── plan-initial.md       # Original design plan
+│   └── ...                   # Feature guides and design docs
+├── scripts/              # Python/bash helper scripts
+│   ├── create-workbench.py        # Create a project + workbench (replicates dashboard flow)
+│   ├── patch-gatewayconfig-tls.py # Disable IDP cert verification for self-signed CA
+│   ├── setup-admin-rbac.py        # Grant admin user cluster permissions
+│   └── rebuild.sh                 # Full teardown + rebuild
 ├── simulator/            # Rust project — the ocp-sim binary
 │   └── src/
 │       ├── main.rs
+│       ├── util.rs            # Shared helpers (TLS, API resources, node IP)
 │       ├── oauth/             # Auth server (OAuth + BYOIDC proxy)
 │       │   ├── mod.rs         #   entry point, request router, re-exports
 │       │   ├── types.rs       #   UserStore, OAuthState, JwtKeys, constants
@@ -274,25 +293,12 @@ picoshift/
 │       ├── imagestream.rs     # ImageStream import controller
 │       ├── loadbalancer.rs    # LoadBalancer IP assignment for kind
 │       └── proxy.rs           # Reverse proxy for Route + HTTPRoute traffic
-├── users.yaml            # Default OAuth users (admin, user1, developer)
-├── deploy/               # Kubernetes manifests
-│   ├── simulator.yaml        # ocp-sim DaemonSet
-│   ├── entra-mock.yaml       # Entra ID mock OIDC provider
-│   ├── seaweedfs.yaml        # Object storage for model serving
-│   └── sklearn-*.yaml        # Model serving examples
-├── docs/                 # Design docs and feature guides
-├── scripts/              # Python/bash helper scripts
-│   ├── create-workbench.py        # Create a project + workbench (replicates dashboard flow)
-│   ├── patch-gatewayconfig-tls.py # Disable IDP cert verification for self-signed CA
-│   ├── setup-admin-rbac.py        # Grant admin user cluster permissions
-│   └── rebuild.sh                 # Full teardown + rebuild
-├── bugs.odh/             # Documented upstream ODH bugs found during testing
-├── kind/                 # kind cluster config
 └── Makefile
 ```
 
-`example.src/` (git-ignored) holds cloned dependencies: a kind fork with the
-ocp-shim, the opendatahub-operator source, and optionally the ODH Dashboard.
+`deps/` (git-ignored) holds cloned dependencies: a kind fork with the ocp-shim,
+the opendatahub-operator source, and the entra-id-emulator. Run `make init-deps`
+to clone them automatically.
 
 ## How it works
 

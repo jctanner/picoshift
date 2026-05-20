@@ -1,5 +1,5 @@
 CLUSTER_NAME   ?= ocp-sim
-KIND_FORK_DIR  := example.src/kind
+KIND_FORK_DIR  := deps/kind
 KIND_BIN       := $(KIND_FORK_DIR)/bin/kind
 K8S_VERSION    ?= v1.33.1
 BASE_IMAGE     := kindest/base:ocp-shim
@@ -74,7 +74,6 @@ help:
 	@echo "Workbench & Model Serving:"
 	@echo "  workbench          Create a workbench (WORKBENCH_PROJECT, WORKBENCH_NAME, WORKBENCH_IMAGE)"
 	@echo "  deploy-model-serving  Deploy SeaweedFS + sklearn model serving"
-	@echo "  deploy-fraud-tutorial Deploy fraud detection tutorial end-to-end"
 	@echo ""
 	@echo "Operate:"
 	@echo "  status             Show cluster, node, simulator, and CRD status"
@@ -82,6 +81,7 @@ help:
 	@echo "  verify             Run verification checks"
 	@echo ""
 	@echo "Kind Images:"
+	@echo "  init-deps          Clone/update required repos into deps/"
 	@echo "  kind-cli           Build the kind CLI binary"
 	@echo "  kind-base-image    Build the base image (includes ocp-shim)"
 	@echo "  kind-node-image    Build the node image"
@@ -109,6 +109,9 @@ all-byoidc: build-all cluster deploy-crds
 
 rebuild:
 	bash scripts/rebuild.sh
+
+init-deps:
+	bash scripts/init-deps.sh
 
 build-all: kind-cli kind-base-image kind-node-image sim-image
 
@@ -173,7 +176,7 @@ cluster: kind-cli
 		echo "cluster '$(CLUSTER_NAME)' already exists"; \
 	else \
 		$(SUDO) $(KIND_BIN) create cluster \
-			--config kind/cluster.yaml \
+			--config deploy/kind/cluster.yaml \
 			--image $(NODE_IMAGE) \
 			--name $(CLUSTER_NAME); \
 		$(SUDO) $(KIND_BIN) get kubeconfig --name $(CLUSTER_NAME) > $(shell echo ~$(shell id -un))/.kube/config; \
@@ -193,32 +196,32 @@ deploy: deploy-crds deploy-seed deploy-sim setup-admin-rbac
 deploy-crds:
 	@echo "Waiting for API server..."
 	@kubectl wait --for=condition=Ready node --all --timeout=120s
-	kubectl apply -f crds/openshift/
-	kubectl apply -f crds/olm/
-	kubectl apply -f crds/gateway/
-	kubectl apply -f crds/monitoring/
-	kubectl apply -f crds/istio/
-	kubectl apply --server-side -f crds/jobset/
-	kubectl apply -f crds/authorino/
-	kubectl apply -f crds/kuadrant/
+	kubectl apply -f deploy/crds/openshift/
+	kubectl apply -f deploy/crds/olm/
+	kubectl apply -f deploy/crds/gateway/
+	kubectl apply -f deploy/crds/monitoring/
+	kubectl apply -f deploy/crds/istio/
+	kubectl apply --server-side -f deploy/crds/jobset/
+	kubectl apply -f deploy/crds/authorino/
+	kubectl apply -f deploy/crds/kuadrant/
 	kubectl wait --for=condition=Established crd --all --timeout=30s
 
 deploy-seed: deploy-seed-resources deploy-clusterversion deploy-endpoint-patch
 
 deploy-seed-resources:
-	kubectl apply -f seed/namespaces.yaml
-	kubectl apply -f seed/cluster-config.yaml
+	kubectl apply -f deploy/seed/namespaces.yaml
+	kubectl apply -f deploy/seed/cluster-config.yaml
 ifeq ($(AUTH_MODE),legacy)
-	kubectl apply -f seed/authentication.yaml
+	kubectl apply -f deploy/seed/authentication.yaml
 else
-	kubectl apply -f seed/authentication.yaml
-	kubectl apply -f seed/authentication-oidc.yaml
+	kubectl apply -f deploy/seed/authentication.yaml
+	kubectl apply -f deploy/seed/authentication-oidc.yaml
 endif
-	kubectl apply -f seed/ingress.yaml
-	kubectl apply -f seed/infrastructure.yaml
-	kubectl apply -f seed/sccs.yaml
-	kubectl apply -f seed/jobset-operator.yaml
-	kubectl apply -f seed/rbac-compat.yaml
+	kubectl apply -f deploy/seed/ingress.yaml
+	kubectl apply -f deploy/seed/infrastructure.yaml
+	kubectl apply -f deploy/seed/sccs.yaml
+	kubectl apply -f deploy/seed/jobset-operator.yaml
+	kubectl apply -f deploy/seed/rbac-compat.yaml
 
 deploy-endpoint-patch:
 	@# Route in-cluster kubernetes service traffic through the ocp-shim (port 6443)
@@ -241,7 +244,7 @@ deploy-clusterversion:
 deploy-sim: sim-image sim-load
 	kubectl wait --for=condition=Ready node --all --timeout=120s
 	kubectl create namespace ocp-sim 2>/dev/null || true
-	kubectl -n ocp-sim create configmap ocp-sim-users --from-file=users.yaml --dry-run=client -o yaml | kubectl apply -f -
+	kubectl -n ocp-sim create configmap ocp-sim-users --from-file=deploy/users.yaml --dry-run=client -o yaml | kubectl apply -f -
 	kubectl apply -f deploy/simulator.yaml
 ifeq ($(AUTH_MODE),oidc)
 	kubectl -n ocp-sim patch daemonset ocp-sim --type=json \
@@ -259,9 +262,9 @@ endif
 		--timeout=120s
 
 deploy-maas:
-	kubectl apply -f crds/maas/
+	kubectl apply -f deploy/crds/maas/
 	kubectl wait --for=condition=Established crd --all --timeout=30s
-	kubectl apply -f seed/maas.yaml
+	kubectl apply -f deploy/seed/maas.yaml
 
 deploy-entra-mock:
 	bash scripts/deploy-entra-mock.sh
@@ -357,7 +360,7 @@ verify:
 # ODH Operator
 # ──────────────────────────────────────────────
 
-ODH_DIR            := example.src/opendatahub-operator
+ODH_DIR            := deps/opendatahub-operator
 ODH_OPERATOR_IMAGE := localhost/odh-operator:latest
 ODH_KUSTOMIZE      := $(ODH_DIR)/bin/kustomize
 OPERATOR_NAMESPACE := opendatahub-operator-system
@@ -420,7 +423,7 @@ dsci:
 		-p '{"spec":{"verifyProviderCertificate":false}}'
 
 dsc:
-	kubectl apply -f seed/datasciencecluster.yaml
+	kubectl apply -f deploy/seed/datasciencecluster.yaml
 
 dsc-enable-maas:
 	kubectl patch datasciencecluster default-dsc --type=merge \
@@ -474,9 +477,6 @@ setup-admin-rbac:
 
 deploy-model-serving:
 	python3 scripts/deploy-model-serving.py
-
-deploy-fraud-tutorial:
-	cd odh.mcp && .venv/bin/python ../scripts/deploy-fraud-tutorial.py
 
 # ──────────────────────────────────────────────
 # Gateway Stack (Istio + Kuadrant)

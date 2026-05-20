@@ -3,7 +3,7 @@ set -euo pipefail
 
 CLUSTER_NAME="${CLUSTER_NAME:-ocp-sim}"
 SUDO="${SUDO:-sudo}"
-ENTRA_SRC="example.src/entra-id-emulator"
+ENTRA_SRC="deps/entra-id-emulator"
 ENTRA_IMAGE="localhost/entra-mock:latest"
 
 echo "=== Building entra-mock image ==="

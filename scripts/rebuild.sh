@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CLUSTER_NAME="${CLUSTER_NAME:-ocp-sim}"
-KIND_FORK_DIR="example.src/kind"
+KIND_FORK_DIR="deps/kind"
 KIND_BIN="${KIND_FORK_DIR}/bin/kind"
 K8S_VERSION="${K8S_VERSION:-v1.33.1}"
 BASE_IMAGE="kindest/base:ocp-shim"
@@ -13,7 +13,7 @@ NODE_IMAGE="localhost/kindest/node:ocp-shim"
 SIM_IMAGE="localhost/ocp-sim:latest"
 SUDO="${SUDO:-sudo}"
 KUBECONFIG_PATH="$(eval echo ~$(id -un))/.kube/config"
-ODH_DIR="example.src/opendatahub-operator"
+ODH_DIR="deps/opendatahub-operator"
 
 cd "$PROJECT_DIR"
 
@@ -59,7 +59,7 @@ $SUDO podman build -t "$SIM_IMAGE" ./simulator
 # ── 7. Create cluster ────────────────────────────────────
 echo "[7/17] Creating kind cluster..."
 $SUDO "$KIND_BIN" create cluster \
-    --config kind/cluster.yaml \
+    --config deploy/kind/cluster.yaml \
     --image "$NODE_IMAGE" \
     --name "$CLUSTER_NAME"
 
@@ -73,21 +73,21 @@ kubectl wait --for=condition=Ready node --all --timeout=120s
 
 # ── 10. Deploy CRDs ──────────────────────────────────────
 echo "[10/17] Installing CRDs..."
-kubectl apply -f crds/openshift/
-kubectl apply -f crds/olm/
-kubectl apply -f crds/gateway/
-kubectl apply -f crds/monitoring/
-kubectl apply -f crds/istio/
+kubectl apply -f deploy/crds/openshift/
+kubectl apply -f deploy/crds/olm/
+kubectl apply -f deploy/crds/gateway/
+kubectl apply -f deploy/crds/monitoring/
+kubectl apply -f deploy/crds/istio/
 kubectl wait --for=condition=Established crd --all --timeout=30s
 
 # ── 11. Deploy seed resources ────────────────────────────
 echo "[11/17] Deploying seed resources..."
-kubectl apply -f seed/namespaces.yaml
-kubectl apply -f seed/cluster-config.yaml
-kubectl apply -f seed/authentication.yaml
-kubectl apply -f seed/ingress.yaml
-kubectl apply -f seed/infrastructure.yaml
-kubectl apply -f seed/sccs.yaml
+kubectl apply -f deploy/seed/namespaces.yaml
+kubectl apply -f deploy/seed/cluster-config.yaml
+kubectl apply -f deploy/seed/authentication.yaml
+kubectl apply -f deploy/seed/ingress.yaml
+kubectl apply -f deploy/seed/infrastructure.yaml
+kubectl apply -f deploy/seed/sccs.yaml
 
 # ── 12. Create ClusterVersion with status ────────────────
 echo "[12/17] Creating ClusterVersion..."
