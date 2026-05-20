@@ -131,6 +131,9 @@ dynamic parts: Route admission, Gateway API / Envoy xDS, OAuth flow, TLS
 certificate injection, LoadBalancer IP assignment, and Namespace → Project
 mirroring.
 
+The original design goals and scope are documented in
+[docs/plan-initial.md](docs/plan-initial.md).
+
 ## What's in the box
 
 | Component | What it does |
