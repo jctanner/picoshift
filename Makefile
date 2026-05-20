@@ -87,6 +87,9 @@ help:
 	@echo "  kind-node-image    Build the node image"
 	@echo "  sim-image          Build the simulator container image"
 	@echo "  shim-hotpatch      Rebuild and replace ocp-shim binary in running cluster"
+	@echo ""
+	@echo "CLI:"
+	@echo "  build-cli          Build the picoshift CLI binary to bin/picoshift"
 
 all: build-all cluster deploy
 	@echo ""
@@ -114,6 +117,9 @@ init-deps:
 	bash scripts/init-deps.sh
 
 build-all: kind-cli kind-base-image kind-node-image sim-image
+
+build-cli:
+	cd cli && go build -o ../bin/picoshift .
 
 # ──────────────────────────────────────────────
 # Kind fork (OCP shim)

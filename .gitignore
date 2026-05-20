@@ -1,6 +1,9 @@
 # Cloned source repos
 deps/
 
+# Build output
+bin/
+
 # Rust
 target/
 **/*.rs.bk

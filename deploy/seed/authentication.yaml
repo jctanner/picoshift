@@ -30,3 +30,20 @@ roleRef:
   kind: ClusterRole
   name: system:openshift:well-known-oauth
   apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: oauth.openshift.io/v1
+kind: OAuthClient
+metadata:
+  name: openshift-challenging-client
+redirectURIs:
+  - https://oauth-openshift.apps.ocp-sim.test/oauth/token/implicit
+grantMethod: auto
+respondWithChallenges: true
+---
+apiVersion: oauth.openshift.io/v1
+kind: OAuthClient
+metadata:
+  name: openshift-browser-client
+redirectURIs:
+  - https://oauth-openshift.apps.ocp-sim.test/oauth/token/display
+grantMethod: auto
