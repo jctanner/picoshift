@@ -34,6 +34,7 @@ deployment, and management.`,
 		cmd.NewDeleteCmd(),
 		cmd.NewStatusCmd(),
 		cmd.NewLogsCmd(),
+		cmd.NewUserCmd(),
 		cmd.NewVersionCmd(Version),
 	)
 

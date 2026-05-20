@@ -74,6 +74,23 @@ impl UserStore {
     pub(crate) fn get(&self, username: &str) -> Option<&UserEntry> {
         self.users.iter().find(|u| u.username == username)
     }
+
+    pub fn from_htpasswd(data: &str) -> Self {
+        let users = data
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .filter_map(|line| {
+                let (user, pass) = line.split_once(':')?;
+                Some(UserEntry {
+                    username: user.trim().to_string(),
+                    password: pass.trim().to_string(),
+                    email: None,
+                    groups: None,
+                })
+            })
+            .collect();
+        Self { users }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +188,7 @@ pub(crate) struct TokenInfo {
 pub(crate) struct OAuthState {
     pub(crate) codes: RwLock<HashMap<String, AuthCode>>,
     pub(crate) tokens: RwLock<HashMap<String, TokenInfo>>,
-    pub(crate) user_store: Arc<UserStore>,
+    pub(crate) user_store: Arc<RwLock<UserStore>>,
     pub(crate) auth_mode: AuthMode,
     pub(crate) jwt_keys: Option<Arc<JwtKeys>>,
     pub(crate) byoidc: Option<Arc<ByoidcConfig>>,
@@ -179,7 +196,7 @@ pub(crate) struct OAuthState {
 }
 
 impl OAuthState {
-    pub(crate) async fn new(user_store: Arc<UserStore>, auth_mode: AuthMode, byoidc: Option<ByoidcConfig>) -> Self {
+    pub(crate) async fn new(user_store: Arc<RwLock<UserStore>>, auth_mode: AuthMode, byoidc: Option<ByoidcConfig>) -> Self {
         let jwt_keys = if matches!(auth_mode, AuthMode::Oidc) {
             Some(Arc::new(JwtKeys::generate()))
         } else {
@@ -263,5 +280,32 @@ mod tests {
     fn default_user_store_has_admin() {
         let store = UserStore::load(None);
         assert!(store.authenticate("admin", "admin").is_some());
+    }
+
+    #[test]
+    fn from_htpasswd_basic() {
+        let store = UserStore::from_htpasswd("alice:pass123\nbob:secret\n");
+        assert_eq!(store.users.len(), 2);
+        assert!(store.authenticate("alice", "pass123").is_some());
+        assert!(store.authenticate("bob", "secret").is_some());
+    }
+
+    #[test]
+    fn from_htpasswd_skips_comments_and_blanks() {
+        let store = UserStore::from_htpasswd("# comment\n\nalice:pass\n  \nbob:s\n");
+        assert_eq!(store.users.len(), 2);
+    }
+
+    #[test]
+    fn from_htpasswd_empty() {
+        let store = UserStore::from_htpasswd("");
+        assert_eq!(store.users.len(), 0);
+    }
+
+    #[test]
+    fn from_htpasswd_no_colon() {
+        let store = UserStore::from_htpasswd("badline\nalice:pass\n");
+        assert_eq!(store.users.len(), 1);
+        assert_eq!(store.users[0].username, "alice");
     }
 }

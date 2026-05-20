@@ -91,7 +91,7 @@ pub(crate) async fn handle_authorize_get(
             ) {
                 if let Ok(cred_str) = std::str::from_utf8(&decoded) {
                     if let Some((user, pass)) = cred_str.split_once(':') {
-                        if let Some(_entry) = state.user_store.authenticate(user, pass) {
+                        if let Some(_entry) = state.user_store.read().await.authenticate(user, pass) {
                             ensure_user_and_identity(client, user).await;
                             return issue_auth_code(state, user, &client_id, &redirect_uri, &req_state, code_challenge.clone(), code_challenge_method.clone()).await;
                         }
@@ -140,7 +140,7 @@ pub(crate) async fn handle_authorize_post(
     let password = params.get("password").cloned().unwrap_or_default();
 
     if username.is_empty()
-        || state.user_store.authenticate(&username, &password).is_none()
+        || state.user_store.read().await.authenticate(&username, &password).is_none()
     {
         let html = login_form_html(&client_id, &redirect_uri, &req_state, &response_type, true);
         return html_response(StatusCode::OK, &html);
@@ -245,13 +245,16 @@ pub(crate) async fn handle_token(
 
     let username = &auth_code.username;
     let token = if let Some(jwt_keys) = &state.jwt_keys {
-        let (email, groups) = match state.user_store.get(username) {
-            Some(entry) => {
-                let email = entry.email.clone().unwrap_or_else(|| format!("{username}@ocp-sim.test"));
-                let groups = entry.groups.clone().unwrap_or_else(|| vec!["system:authenticated".into()]);
-                (email, groups)
+        let (email, groups) = {
+            let store = state.user_store.read().await;
+            match store.get(username) {
+                Some(entry) => {
+                    let email = entry.email.clone().unwrap_or_else(|| format!("{username}@ocp-sim.test"));
+                    let groups = entry.groups.clone().unwrap_or_else(|| vec!["system:authenticated".into()]);
+                    (email, groups)
+                }
+                None => (format!("{username}@ocp-sim.test"), vec!["system:authenticated".into()]),
             }
-            None => (format!("{username}@ocp-sim.test"), vec!["system:authenticated".into()]),
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -361,22 +364,25 @@ pub(crate) async fn handle_userinfo(state: &OAuthState, req: &Request<Incoming>)
     };
 
     let username = &username;
-    let (email, groups) = match state.user_store.get(username) {
-        Some(entry) => {
-            let email = entry
-                .email
-                .clone()
-                .unwrap_or_else(|| format!("{username}@ocp-sim.test"));
-            let groups = entry
-                .groups
-                .clone()
-                .unwrap_or_else(|| vec!["system:authenticated".into()]);
-            (email, groups)
+    let (email, groups) = {
+        let store = state.user_store.read().await;
+        match store.get(username) {
+            Some(entry) => {
+                let email = entry
+                    .email
+                    .clone()
+                    .unwrap_or_else(|| format!("{username}@ocp-sim.test"));
+                let groups = entry
+                    .groups
+                    .clone()
+                    .unwrap_or_else(|| vec!["system:authenticated".into()]);
+                (email, groups)
+            }
+            None => (
+                format!("{username}@ocp-sim.test"),
+                vec!["system:authenticated".into()],
+            ),
         }
-        None => (
-            format!("{username}@ocp-sim.test"),
-            vec!["system:authenticated".into()],
-        ),
     };
 
     json_response(

@@ -4,6 +4,7 @@ mod helpers;
 mod infra;
 mod k8s;
 mod types;
+mod watcher;
 
 pub use byoidc::ByoidcConfig;
 pub use types::UserStore;
@@ -21,6 +22,8 @@ use kube::Client;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
+
+use tokio::sync::RwLock;
 
 use crate::{AuthMode, CaState};
 
@@ -120,7 +123,7 @@ async fn handle_request(
 pub async fn run(
     client: Client,
     ca: Arc<CaState>,
-    user_store: Arc<UserStore>,
+    user_store: Arc<RwLock<UserStore>>,
     auth_mode: AuthMode,
     byoidc_config: Option<ByoidcConfig>,
 ) -> anyhow::Result<()> {
@@ -139,7 +142,9 @@ pub async fn run(
     };
     info!(mode = mode_label, "OAuth auth mode");
 
-    let state = Arc::new(OAuthState::new(user_store, auth_mode, byoidc_config).await);
+    let state = Arc::new(OAuthState::new(user_store.clone(), auth_mode, byoidc_config).await);
+
+    tokio::spawn(watcher::watch_htpasswd_secret(client.clone(), user_store));
 
     {
         let state = state.clone();

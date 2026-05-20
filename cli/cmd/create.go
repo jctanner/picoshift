@@ -227,6 +227,7 @@ func deploySeed(root, authMode string) error {
 		"namespaces.yaml",
 		"cluster-config.yaml",
 		"authentication.yaml",
+		"htpasswd.yaml",
 	}
 	if authMode != "legacy" {
 		files = append(files, "authentication-oidc.yaml")

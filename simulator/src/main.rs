@@ -111,7 +111,9 @@ async fn main() -> anyhow::Result<()> {
         warn!("built-in gateway controller disabled (ENABLE_BUILTIN_GATEWAY=false)");
         tokio::spawn(std::future::pending())
     };
-    let user_store = Arc::new(oauth::UserStore::load(args.users_file.as_deref()));
+    let user_store = Arc::new(tokio::sync::RwLock::new(
+        oauth::UserStore::load(args.users_file.as_deref()),
+    ));
     let auth_mode = args.auth_mode.clone();
     let byoidc_config = if matches!(auth_mode, AuthMode::Byoidc) {
         Some(oauth::ByoidcConfig {
