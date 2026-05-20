@@ -367,3 +367,43 @@ pub(crate) async fn handle_userinfo(state: &OAuthState, req: &Request<Incoming>)
 pub(crate) fn is_cli_auth_request(req: &Request<Incoming>) -> bool {
     req.headers().contains_key("authorization") || req.headers().contains_key("x-csrf-token")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_jwt(claims: &serde_json::Value) -> String {
+        use base64::Engine;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(claims).unwrap());
+        format!("{header}.{payload}.fake-signature")
+    }
+
+    #[test]
+    fn decode_jwt_preferred_username() {
+        let token = make_jwt(&serde_json::json!({
+            "sub": "user-id",
+            "preferred_username": "alice"
+        }));
+        assert_eq!(decode_jwt_username(&token).unwrap(), "alice");
+    }
+
+    #[test]
+    fn decode_jwt_falls_back_to_sub() {
+        let token = make_jwt(&serde_json::json!({ "sub": "bob" }));
+        assert_eq!(decode_jwt_username(&token).unwrap(), "bob");
+    }
+
+    #[test]
+    fn decode_jwt_returns_none_for_garbage() {
+        assert!(decode_jwt_username("not-a-jwt").is_none());
+    }
+
+    #[test]
+    fn decode_jwt_returns_none_for_no_username_claims() {
+        let token = make_jwt(&serde_json::json!({ "iss": "test" }));
+        assert!(decode_jwt_username(&token).is_none());
+    }
+}

@@ -345,3 +345,119 @@ pub async fn run(client: Client, ca: Arc<CaState>) -> anyhow::Result<()> {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uid_range_deterministic() {
+        let a = uid_range_for_namespace("default");
+        let b = uid_range_for_namespace("default");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn uid_range_differs_across_namespaces() {
+        let a = uid_range_for_namespace("alpha");
+        let b = uid_range_for_namespace("beta");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn uid_range_within_expected_bounds() {
+        for ns in ["default", "kube-system", "redhat-ods-applications", "foo-bar-baz"] {
+            let uid = uid_range_for_namespace(ns);
+            assert!(uid >= 1_000_000_000, "uid {uid} below lower bound for ns {ns}");
+            assert!(uid < 2_000_000_000, "uid {uid} above upper bound for ns {ns}");
+        }
+    }
+
+    #[test]
+    fn admission_response_without_patch() {
+        let resp = build_admission_response("test-uid-123", None);
+        assert_eq!(resp["response"]["uid"], "test-uid-123");
+        assert_eq!(resp["response"]["allowed"], true);
+        assert!(resp["response"].get("patchType").is_none());
+        assert!(resp["response"].get("patch").is_none());
+    }
+
+    #[test]
+    fn admission_response_with_patch() {
+        let patch = vec![serde_json::json!({"op": "add", "path": "/spec/x", "value": 1})];
+        let resp = build_admission_response("uid-456", Some(patch));
+        assert_eq!(resp["response"]["uid"], "uid-456");
+        assert_eq!(resp["response"]["allowed"], true);
+        assert_eq!(resp["response"]["patchType"], "JSONPatch");
+        let patch_b64 = resp["response"]["patch"].as_str().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD.decode(patch_b64).unwrap();
+        let ops: Vec<serde_json::Value> = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(ops[0]["op"], "add");
+    }
+
+    #[test]
+    fn compute_patch_no_patch_when_fsgroup_set() {
+        let pod = serde_json::json!({
+            "spec": {
+                "securityContext": { "runAsNonRoot": true, "fsGroup": 1000 },
+                "containers": [{"name": "c"}]
+            }
+        });
+        assert!(compute_patch(&pod, "test-ns").is_none());
+    }
+
+    #[test]
+    fn compute_patch_no_patch_when_no_run_as_non_root() {
+        let pod = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "c"}]
+            }
+        });
+        assert!(compute_patch(&pod, "test-ns").is_none());
+    }
+
+    #[test]
+    fn compute_patch_adds_fsgroup_when_pod_level_non_root() {
+        let pod = serde_json::json!({
+            "spec": {
+                "securityContext": { "runAsNonRoot": true },
+                "containers": [{"name": "c"}]
+            }
+        });
+        let patch = compute_patch(&pod, "my-ns").unwrap();
+        assert_eq!(patch.len(), 1);
+        assert_eq!(patch[0]["path"], "/spec/securityContext/fsGroup");
+        assert_eq!(patch[0]["op"], "add");
+    }
+
+    #[test]
+    fn compute_patch_creates_security_context_when_missing() {
+        let pod = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "securityContext": { "runAsNonRoot": true }
+                }]
+            }
+        });
+        let patch = compute_patch(&pod, "my-ns").unwrap();
+        assert_eq!(patch.len(), 1);
+        assert_eq!(patch[0]["path"], "/spec/securityContext");
+        assert!(patch[0]["value"]["fsGroup"].is_number());
+    }
+
+    #[test]
+    fn compute_patch_container_level_non_root() {
+        let pod = serde_json::json!({
+            "spec": {
+                "securityContext": {},
+                "containers": [{
+                    "name": "app",
+                    "securityContext": { "runAsNonRoot": true }
+                }]
+            }
+        });
+        let patch = compute_patch(&pod, "my-ns").unwrap();
+        assert_eq!(patch[0]["path"], "/spec/securityContext/fsGroup");
+    }
+}

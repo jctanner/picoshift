@@ -156,3 +156,124 @@ pub(crate) fn login_form_html(
         response_type_escaped = html_escape(response_type),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn html_escape_special_chars() {
+        assert_eq!(html_escape("a&b<c>d\"e"), "a&amp;b&lt;c&gt;d&quot;e");
+    }
+
+    #[test]
+    fn html_escape_no_change() {
+        assert_eq!(html_escape("hello world"), "hello world");
+    }
+
+    #[test]
+    fn random_string_correct_length() {
+        assert_eq!(generate_random_string(32).len(), 32);
+        assert_eq!(generate_random_string(0).len(), 0);
+        assert_eq!(generate_random_string(1).len(), 1);
+    }
+
+    #[test]
+    fn random_string_not_constant() {
+        let a = generate_random_string(32);
+        let b = generate_random_string(32);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn parse_query_basic() {
+        let uri: hyper::Uri = "http://x/path?foo=bar&baz=qux".parse().unwrap();
+        let q = parse_query(&uri);
+        assert_eq!(q.get("foo").unwrap(), "bar");
+        assert_eq!(q.get("baz").unwrap(), "qux");
+    }
+
+    #[test]
+    fn parse_query_empty() {
+        let uri: hyper::Uri = "http://x/path".parse().unwrap();
+        let q = parse_query(&uri);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn parse_form_body_basic() {
+        let body = b"username=admin&password=secret";
+        let m = parse_form_body(body);
+        assert_eq!(m.get("username").unwrap(), "admin");
+        assert_eq!(m.get("password").unwrap(), "secret");
+    }
+
+    #[test]
+    fn parse_form_body_empty() {
+        let m = parse_form_body(b"");
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn parse_form_body_url_encoded() {
+        let body = b"redirect_uri=https%3A%2F%2Fexample.com%2Fcallback";
+        let m = parse_form_body(body);
+        assert_eq!(m.get("redirect_uri").unwrap(), "https://example.com/callback");
+    }
+
+    #[test]
+    fn discovery_json_legacy_no_jwks() {
+        let doc = discovery_json(&AuthMode::Legacy);
+        let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert!(v.get("jwks_uri").is_none());
+        assert!(v.get("authorization_endpoint").is_some());
+    }
+
+    #[test]
+    fn discovery_json_oidc_has_jwks() {
+        let doc = discovery_json(&AuthMode::Oidc);
+        let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert!(v.get("jwks_uri").is_some());
+        assert!(v.get("userinfo_endpoint").is_some());
+    }
+
+    #[test]
+    fn discovery_json_byoidc_uses_localhost() {
+        let doc = discovery_json(&AuthMode::Byoidc);
+        let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        let issuer = v["issuer"].as_str().unwrap();
+        assert!(issuer.starts_with("https://localhost:"));
+    }
+
+    #[test]
+    fn login_form_escapes_values() {
+        let html = login_form_html("<script>", "http://x?a=b&c=d", "s", "code", false);
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("a=b&amp;c=d"));
+    }
+
+    #[test]
+    fn login_form_shows_error() {
+        let html = login_form_html("c", "r", "s", "code", true);
+        assert!(html.contains("Invalid username or password"));
+    }
+
+    #[test]
+    fn login_form_hides_error() {
+        let html = login_form_html("c", "r", "s", "code", false);
+        assert!(!html.contains("Invalid username or password"));
+    }
+
+    #[test]
+    fn json_response_has_content_type() {
+        let resp = json_response(StatusCode::OK, r#"{"ok":true}"#);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn html_response_has_content_type() {
+        let resp = html_response(StatusCode::OK, "<h1>hi</h1>");
+        assert_eq!(resp.headers().get("content-type").unwrap(), "text/html; charset=utf-8");
+    }
+}

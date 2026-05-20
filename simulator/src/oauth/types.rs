@@ -200,3 +200,66 @@ impl OAuthState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_store() -> UserStore {
+        UserStore {
+            users: vec![
+                UserEntry {
+                    username: "alice".into(),
+                    password: "pass123".into(),
+                    email: Some("alice@test.com".into()),
+                    groups: Some(vec!["admins".into()]),
+                },
+                UserEntry {
+                    username: "bob".into(),
+                    password: "secret".into(),
+                    email: None,
+                    groups: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn authenticate_correct_credentials() {
+        let store = test_store();
+        let user = store.authenticate("alice", "pass123").unwrap();
+        assert_eq!(user.username, "alice");
+        assert_eq!(user.email.as_deref(), Some("alice@test.com"));
+    }
+
+    #[test]
+    fn authenticate_wrong_password() {
+        let store = test_store();
+        assert!(store.authenticate("alice", "wrong").is_none());
+    }
+
+    #[test]
+    fn authenticate_unknown_user() {
+        let store = test_store();
+        assert!(store.authenticate("eve", "pass123").is_none());
+    }
+
+    #[test]
+    fn get_existing_user() {
+        let store = test_store();
+        let user = store.get("bob").unwrap();
+        assert_eq!(user.username, "bob");
+    }
+
+    #[test]
+    fn get_missing_user() {
+        let store = test_store();
+        assert!(store.get("charlie").is_none());
+    }
+
+    #[test]
+    fn default_user_store_has_admin() {
+        let store = UserStore::load(None);
+        assert!(store.authenticate("admin", "admin").is_some());
+    }
+}

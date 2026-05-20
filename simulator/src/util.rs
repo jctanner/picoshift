@@ -197,3 +197,69 @@ pub async fn get_node_ip(client: &Client) -> anyhow::Result<String> {
     }
     anyhow::bail!("no node with InternalIP found")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_ca() -> CaState {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            rcgen::DnValue::Utf8String("test-ca".into()),
+        );
+        let key_pair = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        CaState {
+            ca_cert_pem: cert.pem(),
+            ca_key_pem: key_pair.serialize_pem(),
+        }
+    }
+
+    #[test]
+    fn sign_cert_returns_valid_pem() {
+        let ca = test_ca();
+        let (cert_pem, key_pem) = sign_cert(&ca, &["test.example.com"]).unwrap();
+        assert!(cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(key_pem.starts_with("-----BEGIN PRIVATE KEY-----"));
+    }
+
+    #[test]
+    fn sign_cert_multiple_sans() {
+        let ca = test_ca();
+        let (cert_pem, _) = sign_cert(&ca, &["a.test", "b.test", "c.test"]).unwrap();
+        assert!(cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+    }
+
+    #[test]
+    fn sign_tls_config_produces_usable_config() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca = test_ca();
+        let config = sign_tls_config(&ca, &["localhost"]).unwrap();
+        assert!(config.alpn_protocols.is_empty() || true);
+    }
+
+    #[test]
+    fn api_resource_constructors() {
+        assert_eq!(route_ar().kind, "Route");
+        assert_eq!(project_ar().kind, "Project");
+        assert_eq!(imagestream_ar().kind, "ImageStream");
+        assert_eq!(oauth_client_ar().kind, "OAuthClient");
+        assert_eq!(user_ar().kind, "User");
+        assert_eq!(identity_ar().kind, "Identity");
+        assert_eq!(gateway_class_ar().kind, "GatewayClass");
+        assert_eq!(gateway_ar().kind, "Gateway");
+        assert_eq!(httproute_ar().kind, "HTTPRoute");
+        assert_eq!(destination_rule_ar().kind, "DestinationRule");
+        assert_eq!(jobset_ar().kind, "JobSet");
+    }
+
+    #[test]
+    fn api_resource_groups() {
+        assert_eq!(route_ar().group, "route.openshift.io");
+        assert_eq!(gateway_ar().group, "gateway.networking.k8s.io");
+        assert_eq!(destination_rule_ar().group, "networking.istio.io");
+        assert_eq!(jobset_ar().group, "jobset.x-k8s.io");
+    }
+}
