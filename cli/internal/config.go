@@ -34,6 +34,10 @@ const (
 
 	ByoidcIssuerURL = "https://entra.apps.ocp-sim.test/" + EntraMockTenantID + "/v2.0"
 
+	PullSecretName     = "rh-pull-secret"
+	RedHatCatalogImage = "registry.redhat.io/redhat/redhat-operator-index:v4.17"
+	GatewayAPICRDsURL  = "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.3.0/standard-install.yaml"
+
 	OLMDefaultVersion = "v0.42.0"
 	OLMNamespace      = "olm"
 )

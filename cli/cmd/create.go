@@ -12,10 +12,13 @@ import (
 
 func NewCreateCmd(version string) *cobra.Command {
 	var (
-		name     string
-		authMode string
-		noDeploy bool
-		build    bool
+		name       string
+		authMode   string
+		noDeploy   bool
+		build      bool
+		pullSecret string
+		withOLM    bool
+		withOSSM3  bool
 	)
 
 	cmd := &cobra.Command{
@@ -35,10 +38,25 @@ run 'picoshift build' separately.`,
 			if authMode != "legacy" && authMode != "oidc" && authMode != "byoidc" {
 				return fmt.Errorf("invalid --auth-mode %q: must be legacy, oidc, or byoidc", authMode)
 			}
+			if withOSSM3 {
+				if pullSecret == "" {
+					return fmt.Errorf("--with-ossm3 requires --pull-secret")
+				}
+				withOLM = true
+			}
 
 			totalSteps := 8
 			if authMode == "byoidc" {
 				totalSteps += 2
+			}
+			if pullSecret != "" {
+				totalSteps++
+			}
+			if withOLM {
+				totalSteps++
+			}
+			if withOSSM3 {
+				totalSteps++
 			}
 			if build {
 				totalSteps += 4
@@ -206,6 +224,30 @@ run 'picoshift build' separately.`,
 				return err
 			}
 
+			if pullSecret != "" {
+				step++
+				fmt.Printf("[%d/%d] Storing pull secret...\n", step, totalSteps)
+				if err := storePullSecret(pullSecret); err != nil {
+					return err
+				}
+			}
+
+			if withOLM {
+				step++
+				fmt.Printf("[%d/%d] Installing OLM...\n", step, totalSteps)
+				if err := installOLM(root); err != nil {
+					return err
+				}
+			}
+
+			if withOSSM3 {
+				step++
+				fmt.Printf("[%d/%d] Installing OSSM3 gateway stack...\n", step, totalSteps)
+				if err := installOSSM3(name, pullSecret); err != nil {
+					return err
+				}
+			}
+
 			fmt.Println("\n=== Ready ===")
 			fmt.Println("  picoshift status")
 			fmt.Println("  picoshift logs")
@@ -218,6 +260,9 @@ run 'picoshift build' separately.`,
 	cmd.Flags().StringVar(&authMode, "auth-mode", internal.DefaultAuthMode, "Auth mode: legacy, oidc, or byoidc")
 	cmd.Flags().BoolVar(&noDeploy, "no-deploy", false, "Create cluster only, skip CRDs/seed/simulator")
 	cmd.Flags().BoolVar(&build, "build", false, "Build all images before creating the cluster")
+	cmd.Flags().StringVar(&pullSecret, "pull-secret", "", "Path to Docker/Podman config.json with registry credentials")
+	cmd.Flags().BoolVar(&withOLM, "with-olm", false, "Install OLM (Operator Lifecycle Manager)")
+	cmd.Flags().BoolVar(&withOSSM3, "with-ossm3", false, "Install OSSM3 gateway stack (implies --with-olm, requires --pull-secret)")
 
 	return cmd
 }
@@ -424,8 +469,12 @@ func patchAPIServerOIDC(clusterName string) error {
 
 	fmt.Println("  Waiting for kube-apiserver to restart...")
 	time.Sleep(20 * time.Second)
-	if err := internal.RunQuiet("kubectl", "get", "nodes", "--request-timeout=60s"); err != nil {
-		time.Sleep(10 * time.Second)
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := internal.RunQuiet("kubectl", "get", "nodes", "--request-timeout=10s"); err == nil {
+			break
+		}
+		time.Sleep(5 * time.Second)
 	}
 	if err := internal.Run("kubectl", "get", "nodes", "--request-timeout=60s"); err != nil {
 		return fmt.Errorf("kube-apiserver did not recover after OIDC patch: %w", err)
@@ -433,4 +482,246 @@ func patchAPIServerOIDC(clusterName string) error {
 
 	fmt.Println("  kube-apiserver OIDC configuration complete")
 	return nil
+}
+
+func storePullSecret(pullSecretPath string) error {
+	_ = internal.RunQuiet("kubectl", "-n", internal.SimNamespace,
+		"delete", "secret", internal.PullSecretName, "--ignore-not-found")
+	return internal.Run("kubectl", "-n", internal.SimNamespace,
+		"create", "secret", "docker-registry", internal.PullSecretName,
+		fmt.Sprintf("--from-file=.dockerconfigjson=%s", pullSecretPath))
+}
+
+func installOLM(root string) error {
+	if isOLMInstalled() {
+		fmt.Println("  OLM is already installed")
+		return nil
+	}
+
+	version := internal.OLMDefaultVersion
+	base := olmBaseURL(version)
+
+	fmt.Println("  Removing stub OLM CRDs...")
+	_ = internal.RunQuiet("kubectl", "delete", "-f",
+		filepath.Join(root, "deploy/crds/olm/"), "--ignore-not-found")
+
+	fmt.Printf("  Installing OLM %s CRDs...\n", version)
+	if err := internal.Run("kubectl", "create", "-f", base+"/crds.yaml"); err != nil {
+		return fmt.Errorf("failed to install OLM CRDs: %w", err)
+	}
+	if err := internal.Run("kubectl", "wait", "--for=condition=Established",
+		"crd", "--all", "--timeout=30s"); err != nil {
+		return err
+	}
+
+	fmt.Printf("  Installing OLM %s controllers...\n", version)
+	if err := internal.Run("kubectl", "create", "-f", base+"/olm.yaml"); err != nil {
+		return fmt.Errorf("failed to install OLM controllers: %w", err)
+	}
+
+	fmt.Println("  Waiting for OLM rollout...")
+	for _, deploy := range []string{"olm-operator", "catalog-operator"} {
+		if err := internal.Run("kubectl", "rollout", "status",
+			fmt.Sprintf("deployment/%s", deploy),
+			"-n", internal.OLMNamespace, "--timeout=120s"); err != nil {
+			return fmt.Errorf("%s failed to roll out: %w", deploy, err)
+		}
+	}
+
+	fmt.Println("  Deploying community operators catalog...")
+	if err := internal.Run("kubectl", "apply", "-f",
+		filepath.Join(root, "deploy/olm/catalogsource.yaml")); err != nil {
+		return fmt.Errorf("failed to deploy CatalogSource: %w", err)
+	}
+	if err := waitForCatalogSource("community-operators", 5*time.Minute); err != nil {
+		return err
+	}
+
+	fmt.Println("  OLM installed")
+	return nil
+}
+
+func installNodePullSecret(clusterName, pullSecretPath string) error {
+	controlPlane := clusterName + "-control-plane"
+
+	if err := internal.RunSudo("podman", "cp",
+		pullSecretPath, controlPlane+":/tmp/pull-secret.json"); err != nil {
+		return fmt.Errorf("failed to copy pull secret to node: %w", err)
+	}
+
+	// Generate hosts.toml for each registry using jq + shell on the node
+	if err := internal.RunSudo("podman", "exec", controlPlane, "sh", "-c", `
+for registry in $(jq -r '.auths | keys[]' /tmp/pull-secret.json); do
+  auth=$(jq -r --arg r "$registry" '.auths[$r].auth // empty' /tmp/pull-secret.json)
+  [ -z "$auth" ] && continue
+  mkdir -p "/etc/containerd/certs.d/$registry"
+  cat > "/etc/containerd/certs.d/$registry/hosts.toml" <<HOSTEOF
+server = "https://$registry"
+
+[host."https://$registry"]
+  capabilities = ["pull", "resolve"]
+  [host."https://$registry".header]
+    Authorization = ["Basic $auth"]
+HOSTEOF
+done
+`); err != nil {
+		return fmt.Errorf("failed to generate containerd hosts config: %w", err)
+	}
+
+	if err := internal.RunSudo("podman", "exec", controlPlane, "sh", "-c",
+		`grep -q 'config_path' /etc/containerd/config.toml || `+
+			`sed -i '/\[plugins\."io\.containerd\.grpc\.v1\.cri"\.registry\]/a\  config_path = "/etc/containerd/certs.d"' /etc/containerd/config.toml || `+
+			`printf '\n[plugins."io.containerd.grpc.v1.cri".registry]\n  config_path = "/etc/containerd/certs.d"\n' >> /etc/containerd/config.toml`,
+	); err != nil {
+		return fmt.Errorf("failed to configure containerd config_path: %w", err)
+	}
+
+	if err := internal.RunSudo("podman", "exec", controlPlane,
+		"systemctl", "restart", "containerd"); err != nil {
+		return fmt.Errorf("failed to restart containerd: %w", err)
+	}
+
+	time.Sleep(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := internal.RunQuiet("kubectl", "get", "nodes", "--request-timeout=5s"); err == nil {
+			return nil
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return fmt.Errorf("node did not recover after containerd restart")
+}
+
+func installOSSM3(clusterName, pullSecretPath string) error {
+	fmt.Println("  Installing node-level pull secret...")
+	if err := installNodePullSecret(clusterName, pullSecretPath); err != nil {
+		return err
+	}
+
+	fmt.Println("  Adding redhat-operators catalog...")
+	secretName := "catalog-pull-redhat-operators"
+	_ = internal.RunQuiet("kubectl", "-n", internal.OLMNamespace,
+		"delete", "secret", secretName, "--ignore-not-found")
+	if err := internal.Run("kubectl", "-n", internal.OLMNamespace,
+		"create", "secret", "docker-registry", secretName,
+		fmt.Sprintf("--from-file=.dockerconfigjson=%s", pullSecretPath),
+	); err != nil {
+		return fmt.Errorf("failed to create catalog pull secret: %w", err)
+	}
+	if err := applyCatalogSource("redhat-operators", internal.RedHatCatalogImage, secretName); err != nil {
+		return err
+	}
+	if err := waitForCatalogSource("redhat-operators", 5*time.Minute); err != nil {
+		return err
+	}
+
+	fmt.Println("  Installing Gateway API CRDs (v1 + v1beta1)...")
+	if err := internal.Run("kubectl", "apply", "-f", internal.GatewayAPICRDsURL); err != nil {
+		return fmt.Errorf("failed to install Gateway API CRDs: %w", err)
+	}
+
+	fmt.Println("  Removing stub Istio CRDs (conflict with servicemeshoperator3)...")
+	_ = internal.RunQuiet("kubectl", "delete", "crd", "-l",
+		"operators.coreos.com/sailoperator.openshift-operators", "--ignore-not-found")
+	for _, crd := range []string{
+		"istios.sailoperator.io",
+		"istiocnis.sailoperator.io",
+		"istiorevisions.sailoperator.io",
+		"remoteistios.sailoperator.io",
+		"ztunnels.sailoperator.io",
+		"wasmplugins.extensions.istio.io",
+		"telemetries.telemetry.istio.io",
+	} {
+		_ = internal.RunQuiet("kubectl", "delete", "crd", crd, "--ignore-not-found")
+	}
+
+	fmt.Println("  Installing servicemeshoperator3...")
+	if err := ensureOperatorGroup("openshift-operators"); err != nil {
+		return err
+	}
+	if err := createSubscription("servicemeshoperator3", "openshift-operators",
+		"stable-3.0", "redhat-operators"); err != nil {
+		return err
+	}
+	if err := waitForCSV("servicemeshoperator3", "openshift-operators", 5*time.Minute); err != nil {
+		return err
+	}
+
+	fmt.Println("  Creating istio-system namespace and Istio CR...")
+	_ = internal.Run("kubectl", "create", "namespace", internal.IstioNamespace)
+
+	if err := applyIstioCR(); err != nil {
+		return err
+	}
+
+	fmt.Println("  Patching API server audiences for istio-ca...")
+	if err := patchAPIServerAudiences(clusterName); err != nil {
+		return err
+	}
+
+	fmt.Println("  Waiting for istiod...")
+	if err := waitForIstiod(5 * time.Minute); err != nil {
+		return err
+	}
+
+	fmt.Println("  OSSM3 gateway stack installed")
+	return nil
+}
+
+func applyIstioCR() error {
+	cr := `apiVersion: sailoperator.io/v1
+kind: Istio
+metadata:
+  name: openshift-gateway
+spec:
+  namespace: istio-system
+  updateStrategy:
+    type: InPlace
+  values:
+    global:
+      istioNamespace: istio-system
+      priorityClassName: system-cluster-critical
+    pilot:
+      enabled: true
+      env:
+        PILOT_ENABLE_GATEWAY_API: "true"
+        PILOT_ENABLE_ALPHA_GATEWAY_API: "false"
+        PILOT_ENABLE_GATEWAY_API_STATUS: "true"
+        PILOT_ENABLE_GATEWAY_API_DEPLOYMENT_CONTROLLER: "true"
+        PILOT_ENABLE_GATEWAY_API_GATEWAYCLASS_CONTROLLER: "false"
+        PILOT_GATEWAY_API_DEFAULT_GATEWAYCLASS_NAME: "openshift-default"
+        PILOT_GATEWAY_API_CONTROLLER_NAME: "openshift.io/gateway-controller/v1"
+        PILOT_MULTI_NETWORK_DISCOVER_GATEWAY_API: "false"
+        ENABLE_GATEWAY_API_MANUAL_DEPLOYMENT: "false"
+        PILOT_ENABLE_GATEWAY_API_CA_CERT_ONLY: "true"
+        PILOT_ENABLE_GATEWAY_API_COPY_LABELS_ANNOTATIONS: "false"`
+
+	return internal.Run("bash", "-c",
+		fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", cr))
+}
+
+func patchAPIServerAudiences(clusterName string) error {
+	controlPlane := clusterName + "-control-plane"
+	manifest := "/etc/kubernetes/manifests/kube-apiserver.yaml"
+	return internal.RunSudo("podman", "exec", controlPlane, "sh", "-c",
+		fmt.Sprintf(
+			`grep -q -- "--api-audiences=.*istio-ca" %s && exit 0; `+
+				`sed -i '/--service-account-issuer=/a\        - --api-audiences=https://kubernetes.default.svc.cluster.local,istio-ca' %s`,
+			manifest, manifest,
+		),
+	)
+}
+
+func waitForIstiod(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, err := internal.RunOutputQuiet("kubectl", "get", "istio", "openshift-gateway",
+			"-o", "jsonpath={.status.state}")
+		if err == nil && out == "Healthy" {
+			fmt.Println("  istiod is healthy")
+			return nil
+		}
+		time.Sleep(10 * time.Second)
+	}
+	return fmt.Errorf("istiod did not become healthy after %v", timeout)
 }

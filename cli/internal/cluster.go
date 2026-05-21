@@ -87,8 +87,19 @@ func GetAuthMode(context string) string {
 }
 
 func WaitForNode(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := RunQuiet("kubectl", "get", "nodes", "--request-timeout=5s"); err == nil {
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+	remaining := time.Until(deadline)
+	if remaining < 10*time.Second {
+		remaining = 10 * time.Second
+	}
 	return Run("kubectl", "wait", "--for=condition=Ready", "node", "--all",
-		fmt.Sprintf("--timeout=%ds", int(timeout.Seconds())))
+		fmt.Sprintf("--timeout=%ds", int(remaining.Seconds())))
 }
 
 func ExportKubeconfig(root, clusterName string) error {
