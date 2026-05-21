@@ -38,7 +38,7 @@ run 'picoshift build' separately.`,
 
 			totalSteps := 8
 			if authMode == "byoidc" {
-				totalSteps++
+				totalSteps += 2
 			}
 			if build {
 				totalSteps += 4
@@ -190,6 +190,14 @@ run 'picoshift build' separately.`,
 			fmt.Printf("[%d/%d] Deploying simulator...\n", step, totalSteps)
 			if err := deploySim(root, name, authMode); err != nil {
 				return err
+			}
+
+			if authMode == "byoidc" {
+				step++
+				fmt.Printf("[%d/%d] Patching kube-apiserver for BYOIDC...\n", step, totalSteps)
+				if err := patchAPIServerOIDC(name); err != nil {
+					return err
+				}
 			}
 
 			step++
@@ -379,4 +387,50 @@ func deploySim(root, clusterName, authMode string) error {
 	time.Sleep(3 * time.Second)
 	return internal.Run("kubectl", "wait", "--namespace", internal.SimNamespace,
 		"--for=condition=Ready", "pod", "--selector=app=ocp-sim", "--timeout=120s")
+}
+
+func patchAPIServerOIDC(clusterName string) error {
+	controlPlane := clusterName + "-control-plane"
+	manifest := "/etc/kubernetes/manifests/kube-apiserver.yaml"
+
+	fmt.Println("  Extracting OIDC CA cert from simulator proxy...")
+	if err := internal.RunSudo("podman", "exec", controlPlane, "sh", "-c",
+		`echo | openssl s_client -connect localhost:443 -servername entra.apps.ocp-sim.test 2>/dev/null `+
+			`| openssl x509 -outform PEM > /etc/kubernetes/pki/oidc-ca.crt`,
+	); err != nil {
+		return fmt.Errorf("failed to extract OIDC CA cert: %w", err)
+	}
+
+	fmt.Println("  Patching kube-apiserver manifest with OIDC flags...")
+	oidcFlags := fmt.Sprintf(
+		`        - --oidc-issuer-url=%s\n`+
+			`        - --oidc-client-id=picoshift\n`+
+			`        - --oidc-username-claim=preferred_username\n`+
+			`        - --oidc-groups-claim=groups\n`+
+			`        - --oidc-username-prefix=-\n`+
+			`        - --oidc-groups-prefix=\n`+
+			`        - --oidc-ca-file=/etc/kubernetes/pki/oidc-ca.crt`,
+		internal.ByoidcIssuerURL,
+	)
+	if err := internal.RunSudo("podman", "exec", controlPlane, "sh", "-c",
+		fmt.Sprintf(
+			`grep -q -- "--oidc-issuer-url=https://entra" %s && exit 0; `+
+				`sed -i "/--secure-port=16443/a\%s" %s`,
+			manifest, oidcFlags, manifest,
+		),
+	); err != nil {
+		return fmt.Errorf("failed to patch kube-apiserver manifest: %w", err)
+	}
+
+	fmt.Println("  Waiting for kube-apiserver to restart...")
+	time.Sleep(20 * time.Second)
+	if err := internal.RunQuiet("kubectl", "get", "nodes", "--request-timeout=60s"); err != nil {
+		time.Sleep(10 * time.Second)
+	}
+	if err := internal.Run("kubectl", "get", "nodes", "--request-timeout=60s"); err != nil {
+		return fmt.Errorf("kube-apiserver did not recover after OIDC patch: %w", err)
+	}
+
+	fmt.Println("  kube-apiserver OIDC configuration complete")
+	return nil
 }

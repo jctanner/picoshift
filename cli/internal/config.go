@@ -32,6 +32,8 @@ const (
 	EntraMockAdminPass = "changeme1234"
 	EntraMockTenantID  = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 
+	ByoidcIssuerURL = "https://entra.apps.ocp-sim.test/" + EntraMockTenantID + "/v2.0"
+
 	OLMDefaultVersion = "v0.42.0"
 	OLMNamespace      = "olm"
 )
