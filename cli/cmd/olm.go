@@ -33,6 +33,7 @@ community operators catalog (OperatorHub.io).`,
 	cmd.AddCommand(
 		newOlmInstallCmd(),
 		newOlmUninstallCmd(),
+		newOlmCatalogCmd(),
 		newOlmOperatorCmd(),
 	)
 	return cmd
@@ -147,6 +148,147 @@ func newOlmUninstallCmd() *cobra.Command {
 	cmd.Flags().StringVar(&version, "version", internal.OLMDefaultVersion,
 		"OLM version that was installed")
 	return cmd
+}
+
+// --- olm catalog ---
+
+func newOlmCatalogCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "catalog",
+		Short: "Manage operator catalogs",
+	}
+	cmd.AddCommand(
+		newOlmCatalogAddCmd(),
+		newOlmCatalogListCmd(),
+		newOlmCatalogRemoveCmd(),
+	)
+	return cmd
+}
+
+func newOlmCatalogAddCmd() *cobra.Command {
+	var (
+		image      string
+		pullSecret string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "add <catalog-name>",
+		Short: "Add an operator catalog",
+		Long: `Add a CatalogSource to OLM. For Red Hat catalogs that require
+authentication, provide a pull secret file with --pull-secret.
+
+Examples:
+  picoshift olm catalog add redhat-community \
+    --image=registry.redhat.io/redhat/community-operator-index:v4.17 \
+    --pull-secret=~/pull-secret.json`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+
+			if !isOLMInstalled() {
+				return fmt.Errorf("OLM is not installed — run 'picoshift olm install' first")
+			}
+			if image == "" {
+				return fmt.Errorf("--image is required")
+			}
+
+			if pullSecret != "" {
+				fmt.Println("[1/3] Creating pull secret...")
+				secretName := fmt.Sprintf("catalog-pull-%s", name)
+				_ = internal.RunQuiet("kubectl", "-n", internal.OLMNamespace,
+					"delete", "secret", secretName, "--ignore-not-found")
+				if err := internal.Run("kubectl", "-n", internal.OLMNamespace,
+					"create", "secret", "docker-registry", secretName,
+					fmt.Sprintf("--from-file=.dockerconfigjson=%s", pullSecret),
+				); err != nil {
+					return fmt.Errorf("failed to create pull secret: %w", err)
+				}
+				fmt.Printf("[2/3] Creating CatalogSource %s...\n", name)
+				if err := applyCatalogSource(name, image, secretName); err != nil {
+					return err
+				}
+			} else {
+				fmt.Printf("[1/2] Creating CatalogSource %s...\n", name)
+				if err := applyCatalogSource(name, image, ""); err != nil {
+					return err
+				}
+			}
+
+			lastStep := "2/2"
+			if pullSecret != "" {
+				lastStep = "3/3"
+			}
+			fmt.Printf("[%s] Waiting for catalog to be ready...\n", lastStep)
+			if err := waitForCatalogSource(name, 5*time.Minute); err != nil {
+				return err
+			}
+
+			fmt.Printf("\nCatalog %q added\n", name)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&image, "image", "", "Catalog index image (required)")
+	cmd.Flags().StringVar(&pullSecret, "pull-secret", "",
+		"Path to Docker/Podman config.json with registry credentials")
+	return cmd
+}
+
+func newOlmCatalogListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List configured catalogs",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !isOLMInstalled() {
+				return fmt.Errorf("OLM is not installed — run 'picoshift olm install' first")
+			}
+			return internal.Run("kubectl", "get", "catalogsource",
+				"-n", internal.OLMNamespace,
+				"-o", "custom-columns=NAME:.metadata.name,IMAGE:.spec.image,STATE:.status.connectionState.lastObservedState")
+		},
+	}
+}
+
+func newOlmCatalogRemoveCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "remove <catalog-name>",
+		Short: "Remove an operator catalog",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			_ = internal.RunQuiet("kubectl", "-n", internal.OLMNamespace,
+				"delete", "secret", fmt.Sprintf("catalog-pull-%s", name), "--ignore-not-found")
+			if err := internal.Run("kubectl", "-n", internal.OLMNamespace,
+				"delete", "catalogsource", name); err != nil {
+				return err
+			}
+			fmt.Printf("Catalog %q removed\n", name)
+			return nil
+		},
+	}
+}
+
+func applyCatalogSource(name, image, pullSecretName string) error {
+	secretRef := ""
+	if pullSecretName != "" {
+		secretRef = fmt.Sprintf(`
+  secrets:
+    - %s`, pullSecretName)
+	}
+
+	cs := fmt.Sprintf(`apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  sourceType: grpc
+  image: %s
+  displayName: %s%s`,
+		name, internal.OLMNamespace, image, name, secretRef)
+
+	return internal.Run("bash", "-c",
+		fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", cs))
 }
 
 // --- olm operator ---
