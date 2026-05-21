@@ -31,6 +31,9 @@ const (
 	HtpasswdNamespace = "openshift-config"
 	EntraMockAdminPass = "changeme1234"
 	EntraMockTenantID  = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+	OLMDefaultVersion = "v0.42.0"
+	OLMNamespace      = "olm"
 )
 
 func ProjectRoot() (string, error) {

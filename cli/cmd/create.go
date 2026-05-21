@@ -230,14 +230,12 @@ func deployCRDs(root string) error {
 	crdsDir := filepath.Join(root, "deploy/crds")
 	dirs := []string{"openshift", "olm", "gateway", "monitoring", "istio", "authorino", "kuadrant"}
 	for _, d := range dirs {
-		if d == "jobset" {
-			if err := internal.Run("kubectl", "apply", "--server-side", "-f", filepath.Join(crdsDir, d)); err != nil {
-				return err
-			}
-		} else {
-			if err := internal.Run("kubectl", "apply", "-f", filepath.Join(crdsDir, d)); err != nil {
-				return err
-			}
+		if d == "olm" && isOLMInstalled() {
+			fmt.Println("  OLM is running — skipping stub OLM CRDs")
+			continue
+		}
+		if err := internal.Run("kubectl", "apply", "-f", filepath.Join(crdsDir, d)); err != nil {
+			return err
 		}
 	}
 	if err := internal.Run("kubectl", "apply", "--server-side", "-f", filepath.Join(crdsDir, "jobset")); err != nil {

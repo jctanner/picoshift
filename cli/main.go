@@ -35,6 +35,7 @@ deployment, and management.`,
 		cmd.NewStatusCmd(),
 		cmd.NewLogsCmd(),
 		cmd.NewUserCmd(),
+		cmd.NewOlmCmd(),
 		cmd.NewVersionCmd(Version),
 	)
 
