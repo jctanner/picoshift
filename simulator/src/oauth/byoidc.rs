@@ -39,8 +39,26 @@ impl ExternalJwksCache {
             keys: RwLock::new(HashMap::new()),
             discovery: RwLock::new(ExternalOidcDiscovery::default()),
         };
-        cache.refresh(issuer_url).await;
+        for attempt in 1..=5 {
+            cache.refresh(issuer_url).await;
+            if !cache.keys.read().await.is_empty() {
+                break;
+            }
+            if attempt < 5 {
+                warn!(attempt, "BYOIDC: JWKS not loaded yet, retrying in 3s");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
         cache
+    }
+
+    fn rewrite_to_internal(external_url: &str, issuer_url: &str) -> String {
+        let Ok(ext) = Url::parse(external_url) else { return external_url.to_string() };
+        let Ok(iss) = Url::parse(issuer_url) else { return external_url.to_string() };
+        let mut internal = iss.clone();
+        internal.set_path(ext.path());
+        internal.set_query(ext.query());
+        internal.to_string()
     }
 
     pub(crate) async fn refresh(&self, issuer_url: &str) {
@@ -49,7 +67,8 @@ impl ExternalJwksCache {
             .build()
             .unwrap();
 
-        let discovery_url = format!("{}/.well-known/openid-configuration", issuer_url.trim_end_matches('/'));
+        let issuer_trimmed = issuer_url.trim_end_matches('/');
+        let discovery_url = format!("{}/.well-known/openid-configuration", issuer_trimmed);
         let resp = match client.get(&discovery_url).send().await {
             Ok(r) => r,
             Err(e) => { warn!(%e, "BYOIDC: discovery fetch failed"); return; }
@@ -74,7 +93,11 @@ impl ExternalJwksCache {
             return;
         }
 
-        let resp = match client.get(&jwks_uri).send().await {
+        // The discovery doc returns external URLs (e.g. https://entra.apps.ocp-sim.test/...)
+        // but this process IS the proxy for that domain. Rewrite to use the internal service URL.
+        let internal_jwks_uri = Self::rewrite_to_internal(&jwks_uri, issuer_trimmed);
+
+        let resp = match client.get(&internal_jwks_uri).send().await {
             Ok(r) => r,
             Err(e) => { warn!(%e, "BYOIDC: JWKS fetch failed"); return; }
         };

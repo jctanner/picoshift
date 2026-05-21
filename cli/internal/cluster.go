@@ -69,15 +69,18 @@ func GetAuthMode(context string) string {
 	if err != nil {
 		return "unknown"
 	}
-	if strings.Contains(out, "--auth-mode") {
-		parts := strings.Fields(out)
-		for i, p := range parts {
-			if p == "--auth-mode" || p == "\"--auth-mode\"" || p == "'--auth-mode'" {
-				if i+1 < len(parts) {
-					mode := strings.Trim(parts[i+1], "\"',]")
-					return mode
-				}
-			}
+	if !strings.Contains(out, "--auth-mode") {
+		return "legacy"
+	}
+	// Args come back as a JSON array: ["--proxy","--auth-mode","byoidc",...]
+	// Split on comma to handle both JSON and space-separated formats.
+	parts := strings.FieldsFunc(out, func(r rune) bool {
+		return r == ',' || r == ' '
+	})
+	for i, p := range parts {
+		clean := strings.Trim(p, "\"'[]")
+		if clean == "--auth-mode" && i+1 < len(parts) {
+			return strings.Trim(parts[i+1], "\"'[]")
 		}
 	}
 	return "legacy"

@@ -11,6 +11,7 @@ echo "=== Building entra-mock image ==="
 # Build with source code baked in (the upstream Dockerfile expects volume mounts)
 ${SUDO} podman build -t "${ENTRA_IMAGE}" -f - "${ENTRA_SRC}" <<'DOCKERFILE'
 FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

@@ -37,13 +37,22 @@ run 'picoshift build' separately.`,
 			}
 
 			totalSteps := 8
+			if authMode == "byoidc" {
+				totalSteps++
+			}
 			if build {
-				totalSteps = 12
+				totalSteps += 4
+				if authMode == "byoidc" {
+					totalSteps++
+				}
 			}
 			if noDeploy {
 				totalSteps = 2
 				if build {
 					totalSteps = 6
+					if authMode == "byoidc" {
+						totalSteps++
+					}
 				}
 			}
 
@@ -96,6 +105,14 @@ run 'picoshift build' separately.`,
 					filepath.Join(root, "simulator"),
 				); err != nil {
 					return err
+				}
+
+				if authMode == "byoidc" {
+					step++
+					fmt.Printf("[%d/%d] Building entra-mock image...\n", step, totalSteps)
+					if err := buildEntraMock(root); err != nil {
+						return err
+					}
 				}
 			}
 
@@ -159,6 +176,14 @@ run 'picoshift build' separately.`,
 			fmt.Printf("[%d/%d] Creating ClusterVersion...\n", step, totalSteps)
 			if err := deployClusterVersion(); err != nil {
 				return err
+			}
+
+			if authMode == "byoidc" {
+				step++
+				fmt.Printf("[%d/%d] Deploying entra-mock...\n", step, totalSteps)
+				if err := deployEntraMock(root, name); err != nil {
+					return err
+				}
 			}
 
 			step++
@@ -227,7 +252,9 @@ func deploySeed(root, authMode string) error {
 		"namespaces.yaml",
 		"cluster-config.yaml",
 		"authentication.yaml",
-		"htpasswd.yaml",
+	}
+	if authMode != "byoidc" {
+		files = append(files, "htpasswd.yaml")
 	}
 	if authMode != "legacy" {
 		files = append(files, "authentication-oidc.yaml")
@@ -270,6 +297,28 @@ curl -s -X PUT http://localhost:8199/apis/config.openshift.io/v1/clusterversions
 kill $PROXY_PID 2>/dev/null; wait $PROXY_PID 2>/dev/null || true
 `
 	return internal.Run("bash", "-c", script)
+}
+
+func deployEntraMock(root, clusterName string) error {
+	if err := internal.RunSudo(
+		"podman", "save", internal.EntraMockImage,
+		"--format", "oci-archive", "-o", "/tmp/entra-mock-oci.tar",
+	); err != nil {
+		return err
+	}
+	if err := internal.Run("bash", "-c", fmt.Sprintf(
+		"%s podman exec -i %s-control-plane ctr --namespace=k8s.io images import --no-unpack - < /tmp/entra-mock-oci.tar",
+		internal.Sudo(), clusterName,
+	)); err != nil {
+		return err
+	}
+	_ = internal.RunSudo("rm", "-f", "/tmp/entra-mock-oci.tar")
+
+	if err := internal.Run("kubectl", "apply", "-f", filepath.Join(root, "deploy/entra-mock.yaml")); err != nil {
+		return err
+	}
+	return internal.Run("kubectl", "-n", internal.EntraMockNamespace,
+		"rollout", "status", "deployment/entra-mock", "--timeout=120s")
 }
 
 func deploySim(root, clusterName, authMode string) error {

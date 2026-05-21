@@ -15,7 +15,8 @@ const (
 	KindBin     = "deps/kind/bin/kind"
 	BaseImage   = "kindest/base:ocp-shim"
 	NodeImage   = "localhost/kindest/node:ocp-shim"
-	SimImage    = "localhost/ocp-sim:latest"
+	SimImage       = "localhost/ocp-sim:latest"
+	EntraMockImage = "localhost/entra-mock:latest"
 
 	KindConfig  = "deploy/kind/cluster.yaml"
 	SimManifest = "deploy/simulator.yaml"

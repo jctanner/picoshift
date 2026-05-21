@@ -9,12 +9,12 @@ import (
 )
 
 func NewBuildCmd() *cobra.Command {
-	var kindOnly, simOnly bool
+	var kindOnly, simOnly, entraOnly bool
 
 	cmd := &cobra.Command{
 		Use:   "build",
 		Short: "Build container images",
-		Long:  "Build the kind CLI, base image, node image, and simulator image.",
+		Long:  "Build the kind CLI, base image, node image, simulator image, and entra-mock image.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			root, err := internal.ProjectRoot()
 			if err != nil {
@@ -26,12 +26,16 @@ func NewBuildCmd() *cobra.Command {
 			if kindOnly {
 				return buildKind(root)
 			}
+			if entraOnly {
+				return buildEntraMock(root)
+			}
 			return buildAll(root)
 		},
 	}
 
 	cmd.Flags().BoolVar(&kindOnly, "kind", false, "Build only kind CLI + images")
 	cmd.Flags().BoolVar(&simOnly, "sim", false, "Build only simulator image")
+	cmd.Flags().BoolVar(&entraOnly, "entra", false, "Build only entra-mock image")
 
 	return cmd
 }
@@ -40,7 +44,10 @@ func buildAll(root string) error {
 	if err := buildKind(root); err != nil {
 		return err
 	}
-	return buildSim(root)
+	if err := buildSim(root); err != nil {
+		return err
+	}
+	return buildEntraMock(root)
 }
 
 func buildKind(root string) error {
@@ -85,4 +92,22 @@ func buildSim(root string) error {
 		"-t", internal.SimImage,
 		filepath.Join(root, "simulator"),
 	)
+}
+
+func buildEntraMock(root string) error {
+	fmt.Println("Building entra-mock image...")
+	script := fmt.Sprintf(`%s podman build -t %s -f - %s <<'DOCKERFILE'
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+RUN mkdir -p /app/data
+EXPOSE 8080
+CMD ["python", "run.py"]
+DOCKERFILE`,
+		internal.Sudo(), internal.EntraMockImage,
+		filepath.Join(root, "deps/entra-id-emulator"))
+	return internal.Run("bash", "-c", script)
 }
