@@ -74,7 +74,11 @@ kubectl wait --for=condition=Ready node --all --timeout=120s
 # ── 10. Deploy CRDs ──────────────────────────────────────
 echo "[10/17] Installing CRDs..."
 kubectl apply -f deploy/crds/openshift/
-kubectl apply -f deploy/crds/olm/
+if kubectl get deployment olm-operator -n olm >/dev/null 2>&1; then
+    echo "OLM is running — skipping stub OLM CRDs"
+else
+    kubectl apply -f deploy/crds/olm/
+fi
 kubectl apply -f deploy/crds/gateway/
 kubectl apply -f deploy/crds/monitoring/
 kubectl apply -f deploy/crds/istio/

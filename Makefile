@@ -88,6 +88,10 @@ help:
 	@echo "  sim-image          Build the simulator container image"
 	@echo "  shim-hotpatch      Rebuild and replace ocp-shim binary in running cluster"
 	@echo ""
+	@echo "OLM:"
+	@echo "  olm-install        Install OLM onto the cluster (via picoshift CLI)"
+	@echo "  olm-uninstall      Remove OLM and restore stub CRDs (via picoshift CLI)"
+	@echo ""
 	@echo "CLI:"
 	@echo "  build-cli          Build the picoshift CLI binary to bin/picoshift"
 
@@ -203,7 +207,11 @@ deploy-crds:
 	@echo "Waiting for API server..."
 	@kubectl wait --for=condition=Ready node --all --timeout=120s
 	kubectl apply -f deploy/crds/openshift/
-	kubectl apply -f deploy/crds/olm/
+	@if kubectl get deployment olm-operator -n olm >/dev/null 2>&1; then \
+		echo "OLM is running — skipping stub OLM CRDs"; \
+	else \
+		kubectl apply -f deploy/crds/olm/; \
+	fi
 	kubectl apply -f deploy/crds/gateway/
 	kubectl apply -f deploy/crds/monitoring/
 	kubectl apply -f deploy/crds/istio/
@@ -556,6 +564,18 @@ istio-delete:
 cert-manager-delete:
 	-helm uninstall cert-manager -n cert-manager 2>/dev/null || true
 	-kubectl delete namespace cert-manager 2>/dev/null || true
+
+# ──────────────────────────────────────────────
+# OLM (via picoshift CLI)
+# ──────────────────────────────────────────────
+
+.PHONY: olm-install olm-uninstall
+
+olm-install:
+	bin/picoshift olm install
+
+olm-uninstall:
+	bin/picoshift olm uninstall
 
 # ──────────────────────────────────────────────
 # Cleanup
