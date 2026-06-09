@@ -87,9 +87,12 @@ func ResolvedKindBin(root string) string {
 	}
 	// In release mode: look next to the picoshift binary first, then PATH
 	if exe, err := os.Executable(); err == nil {
-		candidate := filepath.Join(filepath.Dir(exe), "kind")
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
+		dir := filepath.Dir(exe)
+		for _, name := range []string{"kind-linux-amd64", "kind"} {
+			candidate := filepath.Join(dir, name)
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
 		}
 	}
 	if path, err := exec.LookPath("kind"); err == nil {

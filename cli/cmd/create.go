@@ -279,7 +279,7 @@ func checkDeps(root string) error {
 		if internal.IsDevMode() {
 			fmt.Println("Kind binary not found. Run 'picoshift init' and 'picoshift build --kind' first.")
 		} else {
-			return fmt.Errorf("kind binary not found at %s or on PATH — download it from the picoshift release", kindBin)
+			return fmt.Errorf("kind binary not found — place it next to picoshift (as 'kind' or 'kind-linux-amd64') or on PATH.\nDownload from: https://github.com/jctanner/picoshift/releases/tag/v%s", internal.Version)
 		}
 	}
 	for _, dep := range []string{"kubectl", "podman"} {
