@@ -23,7 +23,7 @@ func NewDeleteCmd() *cobra.Command {
 				return nil
 			}
 			fmt.Printf("=== Deleting cluster %q ===\n", name)
-			kindBin := root + "/" + internal.KindBin
+			kindBin := internal.ResolvedKindBin(root)
 			return internal.RunSudo(kindBin, "delete", "cluster", "--name", name)
 		},
 	}
