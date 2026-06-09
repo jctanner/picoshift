@@ -1,0 +1,208 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+  KIND_REPO: jctanner/kind
+  KIND_BRANCH: OCP_SHIM
+  ENTRA_REPO: jctanner/entra-id-emulator
+  ENTRA_BRANCH: main
+
+jobs:
+  build-cli:
+    name: Build CLI binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout picoshift
+        uses: actions/checkout@v4
+
+      - name: Checkout kind fork
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KIND_REPO }}
+          ref: ${{ env.KIND_BRANCH }}
+          path: deps/kind
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build picoshift (with embedded assets)
+        run: |
+          cp -r deploy scripts cli/
+          cd cli
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -tags embed_assets \
+              -ldflags "-X main.Version=${{ steps.version.outputs.version }}" \
+              -o ../bin/picoshift-linux-amd64 .
+          cd ..
+          rm -rf cli/deploy cli/scripts
+
+      - name: Verify picoshift binary
+        run: ./bin/picoshift-linux-amd64 version
+
+      - name: Build kind
+        run: |
+          cd deps/kind
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -o ../../bin/kind-linux-amd64 .
+
+      - name: Upload CLI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-binaries
+          path: bin/*-linux-amd64
+
+  build-images:
+    name: Build and push container images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout picoshift
+        uses: actions/checkout@v4
+
+      - name: Checkout kind fork
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KIND_REPO }}
+          ref: ${{ env.KIND_BRANCH }}
+          path: deps/kind
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout entra-id-emulator
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ENTRA_REPO }}
+          ref: ${{ env.ENTRA_BRANCH }}
+          path: deps/entra-id-emulator
+
+      - name: Build and push entra-mock image
+        uses: docker/build-push-action@v6
+        with:
+          context: deps/entra-id-emulator
+          file: deploy/entra-mock.Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/entra-mock:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE_PREFIX }}/entra-mock:latest
+
+      - name: Build and push ocp-sim image
+        uses: docker/build-push-action@v6
+        with:
+          context: simulator
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/ocp-sim:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE_PREFIX }}/ocp-sim:latest
+
+      - name: Build kind CLI (for node image build)
+        run: |
+          cd deps/kind
+          go build -o ./bin/kind .
+
+      - name: Build kind base image
+        run: |
+          cp deps/kind/cmd/ocp-shim/main.go deps/kind/cmd/ocp-shim/go.mod deps/kind/cmd/ocp-shim/go.sum deps/kind/images/base/ocp-shim/
+          docker build --build-arg GO_VERSION=1.26.2 -t kindest/base:ocp-shim deps/kind/images/base/
+
+      - name: Build kind node image
+        run: |
+          deps/kind/bin/kind build node-image v1.33.1 \
+            --type release \
+            --base-image kindest/base:ocp-shim \
+            --image ${{ env.IMAGE_PREFIX }}/kindest-node:${{ steps.version.outputs.version }}
+
+      - name: Tag and push node image
+        run: |
+          docker tag \
+            ${{ env.IMAGE_PREFIX }}/kindest-node:${{ steps.version.outputs.version }} \
+            ${{ env.IMAGE_PREFIX }}/kindest-node:latest
+          docker push ${{ env.IMAGE_PREFIX }}/kindest-node:${{ steps.version.outputs.version }}
+          docker push ${{ env.IMAGE_PREFIX }}/kindest-node:latest
+
+  release:
+    name: Create GitHub Release
+    needs: [build-cli, build-images]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-binaries
+          path: bin
+
+      - name: Generate checksums
+        run: |
+          cd bin
+          chmod +x *
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: picoshift ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: bin/*
+          body: |
+            ## Installation
+
+            ```bash
+            # Download binaries
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/picoshift-linux-amd64
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kind-linux-amd64
+            chmod +x picoshift-linux-amd64 kind-linux-amd64
+            sudo mv picoshift-linux-amd64 /usr/local/bin/picoshift
+            sudo mv kind-linux-amd64 /usr/local/bin/kind
+            ```
+
+            ## Container Images
+
+            ```
+            ${{ env.IMAGE_PREFIX }}/ocp-sim:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE_PREFIX }}/kindest-node:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE_PREFIX }}/entra-mock:${{ steps.version.outputs.version }}
+            ```
+
+            ## Quick Start
+
+            ```bash
+            picoshift create
+            ```
+
+            Prerequisites: `podman` (rootful), `kubectl`, `python3`

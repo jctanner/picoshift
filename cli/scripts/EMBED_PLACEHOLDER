@@ -1,0 +1,2 @@
+This file exists so that go:embed can resolve the scripts/ pattern from a clean checkout.
+Real assets are copied here by `make build-cli-release` before release builds.

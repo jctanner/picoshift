@@ -12,6 +12,9 @@ import (
 var Version = "dev"
 
 func main() {
+	internal.Version = Version
+	internal.EmbeddedAssets = embeddedAssets
+
 	rootCmd := &cobra.Command{
 		Use:   "picoshift",
 		Short: "Lightweight OpenShift simulator on kind",

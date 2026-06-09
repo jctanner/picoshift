@@ -16,6 +16,12 @@ func NewBuildCmd() *cobra.Command {
 		Short: "Build container images",
 		Long:  "Build the kind CLI, base image, node image, simulator image, and entra-mock image.",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if !internal.IsDevMode() {
+				fmt.Printf("picoshift %s uses pre-built images from %s — nothing to build.\n",
+					internal.Version, internal.DefaultRegistry)
+				fmt.Println("Use 'picoshift create' to get started.")
+				return nil
+			}
 			root, err := internal.ProjectRoot()
 			if err != nil {
 				return err

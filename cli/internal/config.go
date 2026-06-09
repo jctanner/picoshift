@@ -2,14 +2,24 @@ package internal
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+)
+
+var (
+	Version        string
+	EmbeddedAssets fs.FS
 )
 
 const (
 	DefaultClusterName = "ocp-sim"
 	DefaultK8sVersion  = "v1.33.1"
 	DefaultAuthMode    = "legacy"
+
+	DefaultRegistry = "ghcr.io/jctanner/picoshift"
 
 	KindForkDir = "deps/kind"
 	KindBin     = "deps/kind/bin/kind"
@@ -42,7 +52,60 @@ const (
 	OLMNamespace      = "olm"
 )
 
+func IsDevMode() bool {
+	return Version == "" || Version == "dev"
+}
+
+func versionTag() string {
+	return strings.TrimPrefix(Version, "v")
+}
+
+func ResolvedSimImage() string {
+	if IsDevMode() {
+		return SimImage
+	}
+	return DefaultRegistry + "/ocp-sim:" + versionTag()
+}
+
+func ResolvedNodeImage() string {
+	if IsDevMode() {
+		return NodeImage
+	}
+	return DefaultRegistry + "/kindest-node:" + versionTag()
+}
+
+func ResolvedEntraMockImage() string {
+	if IsDevMode() {
+		return EntraMockImage
+	}
+	return DefaultRegistry + "/entra-mock:" + versionTag()
+}
+
+func ResolvedKindBin(root string) string {
+	if IsDevMode() {
+		return filepath.Join(root, KindBin)
+	}
+	// In release mode: look next to the picoshift binary first, then PATH
+	if exe, err := os.Executable(); err == nil {
+		candidate := filepath.Join(filepath.Dir(exe), "kind")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	if path, err := exec.LookPath("kind"); err == nil {
+		return path
+	}
+	return filepath.Join(root, KindBin)
+}
+
 func ProjectRoot() (string, error) {
+	if !IsDevMode() {
+		return ensureExtractedAssets()
+	}
+	return findProjectRoot()
+}
+
+func findProjectRoot() (string, error) {
 	dir, err := os.Getwd()
 	if err != nil {
 		return "", err
@@ -59,6 +122,57 @@ func ProjectRoot() (string, error) {
 		}
 		dir = parent
 	}
+}
+
+func ensureExtractedAssets() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine home directory: %w", err)
+	}
+	cacheDir := filepath.Join(home, ".cache", "picoshift", versionTag())
+
+	marker := filepath.Join(cacheDir, ".extracted")
+	if _, err := os.Stat(marker); err == nil {
+		return cacheDir, nil
+	}
+
+	fmt.Printf("Extracting embedded assets to %s...\n", cacheDir)
+	if err := extractEmbeddedAssets(cacheDir); err != nil {
+		return "", fmt.Errorf("failed to extract embedded assets: %w", err)
+	}
+
+	_ = os.WriteFile(marker, []byte(Version), 0644)
+	return cacheDir, nil
+}
+
+func extractEmbeddedAssets(destDir string) error {
+	if EmbeddedAssets == nil {
+		return fmt.Errorf("no embedded assets available (built without embed_assets tag?)")
+	}
+	return fs.WalkDir(EmbeddedAssets, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == "." {
+			return nil
+		}
+		dest := filepath.Join(destDir, path)
+		if d.IsDir() {
+			return os.MkdirAll(dest, 0755)
+		}
+		data, err := fs.ReadFile(EmbeddedAssets, path)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+			return err
+		}
+		perm := os.FileMode(0644)
+		if strings.HasSuffix(path, ".sh") || strings.HasSuffix(path, ".py") {
+			perm = 0755
+		}
+		return os.WriteFile(dest, data, perm)
+	})
 }
 
 func Sudo() string {

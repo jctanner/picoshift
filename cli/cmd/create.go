@@ -38,6 +38,11 @@ run 'picoshift build' separately.`,
 			if authMode != "legacy" && authMode != "oidc" && authMode != "byoidc" {
 				return fmt.Errorf("invalid --auth-mode %q: must be legacy, oidc, or byoidc", authMode)
 			}
+			if build && !internal.IsDevMode() {
+				fmt.Printf("picoshift %s uses pre-built images from %s — ignoring --build.\n",
+					internal.Version, internal.DefaultRegistry)
+				build = false
+			}
 			if withOSSM3 {
 				if pullSecret == "" {
 					return fmt.Errorf("--with-ossm3 requires --pull-secret")
@@ -134,17 +139,18 @@ run 'picoshift build' separately.`,
 				}
 			}
 
-			kindBin := filepath.Join(root, internal.KindBin)
+			kindBin := internal.ResolvedKindBin(root)
+			nodeImage := internal.ResolvedNodeImage()
 
 			step++
 			if internal.KindKnows(root, name) {
 				fmt.Printf("[%d/%d] Cluster %q already exists\n", step, totalSteps, name)
 			} else {
-				fmt.Printf("[%d/%d] Creating kind cluster %q...\n", step, totalSteps, name)
+				fmt.Printf("[%d/%d] Creating kind cluster %q (image=%s)...\n", step, totalSteps, name, nodeImage)
 				createArgs := []string{
 					kindBin, "create", "cluster",
 					"--config", filepath.Join(root, internal.KindConfig),
-					"--image", internal.NodeImage,
+					"--image", nodeImage,
 					"--name", name,
 				}
 				maxRetries := 3
@@ -268,8 +274,13 @@ run 'picoshift build' separately.`,
 }
 
 func checkDeps(root string) error {
-	if err := internal.CheckFile(filepath.Join(root, internal.KindBin)); err != nil {
-		fmt.Println("Kind binary not found. Run 'picoshift init' and 'picoshift build --kind' first.")
+	kindBin := internal.ResolvedKindBin(root)
+	if err := internal.CheckFile(kindBin); err != nil {
+		if internal.IsDevMode() {
+			fmt.Println("Kind binary not found. Run 'picoshift init' and 'picoshift build --kind' first.")
+		} else {
+			return fmt.Errorf("kind binary not found at %s or on PATH — download it from the picoshift release", kindBin)
+		}
 	}
 	for _, dep := range []string{"kubectl", "podman"} {
 		if err := internal.CheckDep(dep); err != nil {
@@ -351,6 +362,17 @@ kill $PROXY_PID 2>/dev/null; wait $PROXY_PID 2>/dev/null || true
 }
 
 func deployEntraMock(root, clusterName string) error {
+	if !internal.IsDevMode() {
+		entraMockImage := internal.ResolvedEntraMockImage()
+		fmt.Printf("  Pulling %s...\n", entraMockImage)
+		if err := internal.RunSudo("podman", "pull", entraMockImage); err != nil {
+			return fmt.Errorf("failed to pull entra-mock image: %w", err)
+		}
+		if err := internal.RunSudo("podman", "tag", entraMockImage, internal.EntraMockImage); err != nil {
+			return fmt.Errorf("failed to tag entra-mock image: %w", err)
+		}
+	}
+
 	if err := internal.RunSudo(
 		"podman", "save", internal.EntraMockImage,
 		"--format", "oci-archive", "-o", "/tmp/entra-mock-oci.tar",
@@ -373,6 +395,18 @@ func deployEntraMock(root, clusterName string) error {
 }
 
 func deploySim(root, clusterName, authMode string) error {
+	simImage := internal.ResolvedSimImage()
+
+	if !internal.IsDevMode() {
+		fmt.Printf("  Pulling %s...\n", simImage)
+		if err := internal.RunSudo("podman", "pull", simImage); err != nil {
+			return fmt.Errorf("failed to pull simulator image: %w", err)
+		}
+		if err := internal.RunSudo("podman", "tag", simImage, internal.SimImage); err != nil {
+			return fmt.Errorf("failed to tag simulator image: %w", err)
+		}
+	}
+
 	// Load image into cluster
 	if err := internal.RunSudo(
 		"podman", "save", internal.SimImage,

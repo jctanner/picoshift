@@ -36,7 +36,7 @@ func containerRunning(clusterName string) bool {
 }
 
 func KindKnows(root, clusterName string) bool {
-	kindBin := root + "/" + KindBin
+	kindBin := ResolvedKindBin(root)
 	sudo := Sudo()
 	var out string
 	var err error
@@ -103,7 +103,7 @@ func WaitForNode(timeout time.Duration) error {
 }
 
 func ExportKubeconfig(root, clusterName string) error {
-	kindBin := root + "/" + KindBin
+	kindBin := ResolvedKindBin(root)
 	home, err := RunOutput("sh", "-c", "echo ~$(id -un)")
 	if err != nil {
 		return err

@@ -1,0 +1,7 @@
+# Copied by `make build-cli-release` for go:embed; not checked in.
+# The EMBED_PLACEHOLDER files ARE tracked so `go build -tags embed_assets`
+# resolves the embed patterns even from a clean checkout.
+deploy/*
+scripts/*
+!deploy/EMBED_PLACEHOLDER
+!scripts/EMBED_PLACEHOLDER

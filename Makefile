@@ -128,8 +128,18 @@ init-deps:
 
 build-all: kind-cli kind-base-image kind-node-image sim-image
 
+VERSION ?= dev
+
 build-cli:
-	cd cli && go build -o ../bin/picoshift .
+	cd cli && go build -ldflags "-X main.Version=$(VERSION)" -o ../bin/picoshift .
+
+build-cli-release:
+	@echo "Building release CLI with embedded assets (VERSION=$(VERSION))..."
+	cp -r deploy scripts cli/
+	cd cli && go build -tags embed_assets -ldflags "-X main.Version=$(VERSION)" -o ../bin/picoshift .
+	@# Restore to placeholder-only state (don't delete the dirs entirely)
+	find cli/deploy cli/scripts -type f ! -name EMBED_PLACEHOLDER -delete
+	find cli/deploy cli/scripts -mindepth 1 -type d -empty -delete
 
 # ──────────────────────────────────────────────
 # Kind fork (OCP shim)
