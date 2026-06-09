@@ -75,6 +75,12 @@ help:
 	@echo "  workbench          Create a workbench (WORKBENCH_PROJECT, WORKBENCH_NAME, WORKBENCH_IMAGE)"
 	@echo "  deploy-model-serving  Deploy SeaweedFS + sklearn model serving"
 	@echo ""
+	@echo "Security Scanner:"
+	@echo "  scanner-base-image Build security-dashboard base image (scan tools)"
+	@echo "  scanner-image      Build security-dashboard app image"
+	@echo "  scanner-load       Load security-dashboard image into cluster"
+	@echo "  deploy-scanner     Build, load, and deploy security dashboard"
+	@echo ""
 	@echo "Operate:"
 	@echo "  status             Show cluster, node, simulator, and CRD status"
 	@echo "  logs               Tail simulator logs"
@@ -491,6 +497,45 @@ setup-admin-rbac:
 
 deploy-model-serving:
 	python3 scripts/deploy-model-serving.py
+
+# ──────────────────────────────────────────────
+# Security Scanner
+# ──────────────────────────────────────────────
+
+SCANNER_DIR        := deps/rhoai-security-scanner
+SCANNER_BASE_IMAGE := localhost/security-dashboard-base:latest
+SCANNER_IMAGE      := localhost/security-dashboard:latest
+SCANNER_NAMESPACE  := rhoai-security
+
+.PHONY: scanner-base-image scanner-image scanner-load deploy-scanner
+
+scanner-base-image:
+	$(SUDO) podman build -f $(SCANNER_DIR)/dashboard/Dockerfile.base \
+		-t $(SCANNER_BASE_IMAGE) $(SCANNER_DIR)
+
+scanner-image: scanner-base-image
+	$(SUDO) podman build -f $(SCANNER_DIR)/dashboard/Dockerfile \
+		-t $(SCANNER_IMAGE) $(SCANNER_DIR)
+
+scanner-load:
+	$(SUDO) podman save $(SCANNER_IMAGE) --format oci-archive -o /tmp/security-dashboard-oci.tar
+	$(SUDO) podman exec -i $(CLUSTER_NAME)-control-plane \
+		ctr --namespace=k8s.io images import --no-unpack - < /tmp/security-dashboard-oci.tar
+	$(SUDO) rm -f /tmp/security-dashboard-oci.tar
+
+deploy-scanner: scanner-image scanner-load
+	kubectl create namespace $(SCANNER_NAMESPACE) 2>/dev/null || true
+	kubectl kustomize $(SCANNER_DIR)/dashboard/deploy/base \
+		| sed 's|quay.io/opendatahub/security-dashboard:latest|$(SCANNER_IMAGE)|' \
+		| sed 's|\( *\)image: $(SCANNER_IMAGE)|\1image: $(SCANNER_IMAGE)\n\1imagePullPolicy: Never|' \
+		| sed '/imagePullSecrets:/,/- name: .*/d' \
+		| kubectl apply -n $(SCANNER_NAMESPACE) -f -
+	kubectl -n $(SCANNER_NAMESPACE) set env deployment/security-dashboard \
+		MLFLOW_TRACKING_URI="" \
+		ALLOWED_SCAN_ORGS=opendatahub-io,red-hat-data-services,llm-d-incubation
+	@echo "Waiting for security-dashboard to be ready..."
+	kubectl -n $(SCANNER_NAMESPACE) rollout status deployment/security-dashboard --timeout=120s
+	@echo "Dashboard: https://security-dashboard-$(SCANNER_NAMESPACE).apps.ocp-sim.test"
 
 # ──────────────────────────────────────────────
 # Gateway Stack (Istio + Kuadrant)
