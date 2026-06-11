@@ -24,6 +24,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 use crate::CaState;
+use crate::oauth::types::{DOMAIN, OAUTH_HOST, OAUTH_PORT};
 use crate::util::{route_ar, httproute_ar, gateway_ar, sign_tls_config};
 
 struct RouteBackend {
@@ -106,6 +107,15 @@ fn extract_host(route: &DynamicObject) -> Option<String> {
         .and_then(|ing| ing.get("host"))
         .and_then(|h| h.as_str())
         .map(|s| s.to_string())
+        .or_else(|| {
+            route
+                .data
+                .get("spec")
+                .and_then(|s| s.get("host"))
+                .and_then(|h| h.as_str())
+                .filter(|h| !h.is_empty())
+                .map(|s| s.to_string())
+        })
 }
 
 fn extract_backend(route: &DynamicObject) -> Option<(String, TargetPort, bool)> {
@@ -525,44 +535,53 @@ async fn proxy_request(
         .map(|h| h.split(':').next().unwrap_or(h).to_string())
         .unwrap_or_default();
 
-    let backend = {
-        let t = table.read().await;
-        match t.get(&host) {
-            Some(b) => (b.service_name.clone(), b.service_namespace.clone(), match &b.target_port {
-                TargetPort::Number(n) => TargetPort::Number(*n),
-                TargetPort::Name(s) => TargetPort::Name(s.clone()),
-            }, b.tls),
+    let oauth_host = format!("{OAUTH_HOST}.{DOMAIN}");
+    let entra_host = format!("entra.{DOMAIN}");
+    let is_oauth = host == oauth_host || host == entra_host;
+
+    let (addr, backend_tls) = if is_oauth {
+        (SocketAddr::from(([127, 0, 0, 1], OAUTH_PORT)), true)
+    } else {
+        let backend = {
+            let t = table.read().await;
+            match t.get(&host) {
+                Some(b) => (b.service_name.clone(), b.service_namespace.clone(), match &b.target_port {
+                    TargetPort::Number(n) => TargetPort::Number(*n),
+                    TargetPort::Name(s) => TargetPort::Name(s.clone()),
+                }, b.tls),
+                None => {
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(Full::new(Bytes::from(format!("no route for host: {host}\n"))))
+                        .unwrap());
+                }
+            }
+        };
+
+        let backend_ref = RouteBackend {
+            service_name: backend.0,
+            service_namespace: backend.1,
+            target_port: backend.2,
+            tls: backend.3,
+        };
+
+        let resolved = match resolve_endpoint(&client, &backend_ref).await {
+            Some(a) => a,
             None => {
                 return Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Full::new(Bytes::from(format!("no route for host: {host}\n"))))
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(Full::new(Bytes::from(format!(
+                        "no endpoints for {}/{}\n",
+                        backend_ref.service_namespace, backend_ref.service_name
+                    ))))
                     .unwrap());
             }
-        }
-    };
-
-    let backend_ref = RouteBackend {
-        service_name: backend.0,
-        service_namespace: backend.1,
-        target_port: backend.2,
-        tls: backend.3,
-    };
-
-    let addr = match resolve_endpoint(&client, &backend_ref).await {
-        Some(a) => a,
-        None => {
-            return Ok(Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Full::new(Bytes::from(format!(
-                    "no endpoints for {}/{}\n",
-                    backend_ref.service_namespace, backend_ref.service_name
-                ))))
-                .unwrap());
-        }
+        };
+        (resolved, backend_ref.tls)
     };
 
     let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    let uri = if backend_ref.tls {
+    let uri = if backend_tls {
         path.to_string()
     } else {
         format!("http://{addr}{path}")
@@ -591,13 +610,13 @@ async fn proxy_request(
 
     if is_upgrade {
         info!(host, uri = %uri, "proxying WebSocket upgrade");
-        return proxy_upgrade(req, &host, &uri, addr, backend_ref.tls, tls_incoming).await;
+        return proxy_upgrade(req, &host, &uri, addr, backend_tls, tls_incoming).await;
     }
 
     let body = req.collect().await?.to_bytes();
     let proxy_req = proxy_req.body(Full::new(body)).unwrap();
 
-    let result = if backend_ref.tls {
+    let result = if backend_tls {
         let tcp = match tokio::net::TcpStream::connect(addr).await {
             Ok(t) => t,
             Err(e) => {

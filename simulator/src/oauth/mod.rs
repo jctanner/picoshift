@@ -3,7 +3,7 @@ mod handlers;
 mod helpers;
 mod infra;
 mod k8s;
-mod types;
+pub(crate) mod types;
 mod watcher;
 
 pub use byoidc::ByoidcConfig;
