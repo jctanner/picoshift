@@ -197,10 +197,8 @@ make all
 make all-byoidc
 
 # Install the gateway stack (Istio + cert-manager + Kuadrant)
-# NOTE: picoshift patches the API server to add the "istio-ca" audience
-# automatically during cluster creation (--with-ossm3). If you install
-# the gateway stack separately, you must patch the API server manually
-# or Istio gateway pods will CrashLoop — see docs/bugs/istio-gateway-auth-failure.md
+# NOTE: Istio gateway pods may CrashLoop due to an ocp-shim bug that breaks
+# TokenReview validation — see docs/bugs/picoshift-tokenreview-bug.md
 make gateway-stack
 
 # Build and deploy the ODH operator (includes DSCI, DSC, RBAC)

@@ -55,9 +55,9 @@ This works but it's a different mechanism than real OCP:
 - Does **not** install OLM
 - Does **not** patch the API server `--api-audiences` for `istio-ca`
 
-If Istio gateway pods CrashLoop with authentication failures after using this
-path, the API server audience patch is missing. See
-[bugs/istio-gateway-auth-failure.md](bugs/istio-gateway-auth-failure.md).
+If Istio gateway pods CrashLoop with authentication failures, this is likely
+the ocp-shim TokenReview bug — see
+[bugs/picoshift-tokenreview-bug.md](bugs/picoshift-tokenreview-bug.md).
 
 ## Known issues
 
