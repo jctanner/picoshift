@@ -570,6 +570,9 @@ cert-manager:
 		--wait --timeout 120s
 
 istio:
+	@# NOTE: Istio gateway pods require "istio-ca" in the API server's --api-audiences flag.
+	@# picoshift create --with-ossm3 patches this automatically, but this Makefile path does not.
+	@# If gateway pods CrashLoop with auth failures, see docs/bugs/istio-gateway-auth-failure.md
 	@# Install Istio with the "openshift-gateway" revision and OpenShift controller
 	@# name so it behaves like OSSM/Sail on real OpenShift:
 	@# - revision=openshift-gateway: matches istio.io/rev label set by ODH operator
