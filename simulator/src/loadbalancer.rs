@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Service;
 use kube::api::{Api, Patch, PatchParams};
@@ -6,7 +8,12 @@ use kube::runtime::WatchStreamExt;
 use kube::{Client, ResourceExt};
 use tracing::{info, warn};
 
-use crate::util::get_node_ip;
+static NEXT_OCTET: AtomicU8 = AtomicU8::new(1);
+
+fn next_lb_ip() -> String {
+    let n = NEXT_OCTET.fetch_add(1, Ordering::Relaxed);
+    format!("10.254.0.{n}")
+}
 
 fn needs_ip(svc: &Service) -> bool {
     let is_lb = svc
@@ -30,8 +37,7 @@ fn needs_ip(svc: &Service) -> bool {
 }
 
 pub async fn run(client: Client) -> anyhow::Result<()> {
-    let node_ip = get_node_ip(&client).await?;
-    info!(node_ip, "loadbalancer controller started");
+    info!("loadbalancer controller started (virtual IP pool: 10.254.0.0/24)");
 
     let svcs: Api<Service> = Api::all(client.clone());
     let stream = watcher::watcher(svcs, watcher::Config::default())
@@ -48,11 +54,12 @@ pub async fn run(client: Client) -> anyhow::Result<()> {
                 }
                 let ns = svc.namespace().unwrap_or_default();
                 let name = svc.name_any();
+                let ip = next_lb_ip();
 
                 let status = serde_json::json!({
                     "status": {
                         "loadBalancer": {
-                            "ingress": [{ "ip": node_ip }]
+                            "ingress": [{ "ip": ip }]
                         }
                     }
                 });
@@ -62,7 +69,7 @@ pub async fn run(client: Client) -> anyhow::Result<()> {
                     .patch_status(&name, &PatchParams::apply("ocp-sim"), &Patch::Merge(&status))
                     .await
                 {
-                    Ok(_) => info!(ns, name, node_ip, "assigned LoadBalancer IP"),
+                    Ok(_) => info!(ns, name, ip, "assigned LoadBalancer IP"),
                     Err(e) => warn!(ns, name, %e, "failed to patch LoadBalancer status"),
                 }
             }
