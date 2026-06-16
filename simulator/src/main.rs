@@ -101,16 +101,22 @@ async fn main() -> anyhow::Result<()> {
     let cm_handle = tokio::spawn(service_ca::run_configmap_controller(client.clone(), ca.clone()));
     let mwc_handle = tokio::spawn(service_ca::run_mutating_webhook_controller(client.clone(), ca.clone()));
     let vwc_handle = tokio::spawn(service_ca::run_validating_webhook_controller(client.clone(), ca.clone()));
-    let builtin_gw = std::env::var("ENABLE_BUILTIN_GATEWAY")
-        .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-        .unwrap_or(true);
-    let gw_handle = if builtin_gw {
-        info!("built-in gateway controller enabled");
-        tokio::spawn(gateway::run(client.clone()))
-    } else {
-        warn!("built-in gateway controller disabled (ENABLE_BUILTIN_GATEWAY=false)");
-        tokio::spawn(std::future::pending())
-    };
+
+    macro_rules! optional_controller {
+        ($env_var:expr, $label:expr, $fut:expr) => {{
+            let enabled = std::env::var($env_var)
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                .unwrap_or(true);
+            if enabled {
+                tokio::spawn($fut)
+            } else {
+                warn!(concat!($label, " disabled (", $env_var, "=false)"));
+                tokio::spawn(std::future::pending())
+            }
+        }};
+    }
+
+    let gw_handle = optional_controller!("ENABLE_BUILTIN_GATEWAY", "built-in gateway controller", gateway::run(client.clone()));
     let user_store = Arc::new(tokio::sync::RwLock::new(
         oauth::UserStore::load(args.users_file.as_deref()),
     ));
@@ -125,11 +131,11 @@ async fn main() -> anyhow::Result<()> {
         None
     };
     let oauth_handle = tokio::spawn(oauth::run(client.clone(), ca.clone(), user_store, auth_mode, byoidc_config));
-    let proj_handle = tokio::spawn(project::run(client.clone()));
+    let proj_handle = optional_controller!("ENABLE_PROJECT", "project controller", project::run(client.clone()));
     let scc_handle = tokio::spawn(pod_mutate::run(client.clone(), ca.clone()));
-    let jobset_handle = tokio::spawn(jobset::run(client.clone()));
-    let is_handle = tokio::spawn(imagestream::run(client.clone()));
-    let lb_handle = tokio::spawn(loadbalancer::run(client.clone()));
+    let jobset_handle = optional_controller!("ENABLE_JOBSET", "jobset controller", jobset::run(client.clone()));
+    let is_handle = optional_controller!("ENABLE_IMAGESTREAM", "imagestream controller", imagestream::run(client.clone()));
+    let lb_handle = optional_controller!("ENABLE_LOADBALANCER", "loadbalancer controller", loadbalancer::run(client.clone()));
 
     let proxy_handle = if args.proxy {
         info!(port = args.proxy_port, "starting reverse proxy");

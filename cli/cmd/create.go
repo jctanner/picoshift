@@ -19,7 +19,16 @@ func NewCreateCmd(version string) *cobra.Command {
 		pullSecret string
 		withOLM    bool
 		withOSSM3  bool
+		disable    []string
 	)
+
+	validControllers := map[string]string{
+		"jobset":      "ENABLE_JOBSET",
+		"imagestream": "ENABLE_IMAGESTREAM",
+		"loadbalancer": "ENABLE_LOADBALANCER",
+		"project":     "ENABLE_PROJECT",
+		"gateway":     "ENABLE_BUILTIN_GATEWAY",
+	}
 
 	cmd := &cobra.Command{
 		Use:   "create",
@@ -37,6 +46,15 @@ run 'picoshift build' separately.`,
 
 			if authMode != "legacy" && authMode != "oidc" && authMode != "byoidc" {
 				return fmt.Errorf("invalid --auth-mode %q: must be legacy, oidc, or byoidc", authMode)
+			}
+			for _, c := range disable {
+				if _, ok := validControllers[c]; !ok {
+					names := make([]string, 0, len(validControllers))
+					for k := range validControllers {
+						names = append(names, k)
+					}
+					return fmt.Errorf("unknown controller %q: valid values are %s", c, strings.Join(names, ", "))
+				}
 			}
 			if build && !internal.IsDevMode() {
 				fmt.Printf("picoshift %s uses pre-built images from %s — ignoring --build.\n",
@@ -212,7 +230,7 @@ run 'picoshift build' separately.`,
 
 			step++
 			fmt.Printf("[%d/%d] Deploying simulator...\n", step, totalSteps)
-			if err := deploySim(root, name, authMode); err != nil {
+			if err := deploySim(root, name, authMode, disable, validControllers); err != nil {
 				return err
 			}
 
@@ -269,6 +287,7 @@ run 'picoshift build' separately.`,
 	cmd.Flags().StringVar(&pullSecret, "pull-secret", "", "Path to Docker/Podman config.json with registry credentials")
 	cmd.Flags().BoolVar(&withOLM, "with-olm", false, "Install OLM (Operator Lifecycle Manager)")
 	cmd.Flags().BoolVar(&withOSSM3, "with-ossm3", false, "Install OSSM3 gateway stack (implies --with-olm, requires --pull-secret)")
+	cmd.Flags().StringArrayVar(&disable, "disable", nil, "Disable simulator controllers (jobset, imagestream, loadbalancer, project, gateway)")
 
 	return cmd
 }
@@ -394,7 +413,7 @@ func deployEntraMock(root, clusterName string) error {
 		"rollout", "status", "deployment/entra-mock", "--timeout=120s")
 }
 
-func deploySim(root, clusterName, authMode string) error {
+func deploySim(root, clusterName, authMode string, disable []string, controllerEnvVars map[string]string) error {
 	simImage := internal.ResolvedSimImage()
 
 	if !internal.IsDevMode() {
@@ -456,6 +475,20 @@ func deploySim(root, clusterName, authMode string) error {
 		if err := internal.Run("kubectl", "-n", internal.SimNamespace,
 			"patch", "daemonset", "ocp-sim", "--type=json",
 			fmt.Sprintf(`-p=[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":%s}]`, args),
+		); err != nil {
+			return err
+		}
+	}
+
+	// Patch env vars for disabled controllers
+	for _, name := range disable {
+		envVar := controllerEnvVars[name]
+		patch := fmt.Sprintf(
+			`[{"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":%q,"value":"false"}}]`,
+			envVar,
+		)
+		if err := internal.Run("kubectl", "-n", internal.SimNamespace,
+			"patch", "daemonset", "ocp-sim", "--type=json", "-p="+patch,
 		); err != nil {
 			return err
 		}
