@@ -146,7 +146,7 @@ async fn reconcile_configmap(
     }
 
     let target_key = if inject_trusted {
-        "odh-ca-bundle.crt"
+        "ca-bundle.crt"
     } else {
         "service-ca.crt"
     };
