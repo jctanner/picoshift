@@ -32,8 +32,33 @@ entra-mock admin API.`,
 	return cmd
 }
 
-func context(clusterName string) string {
+func resolveContext(clusterName string) string {
+	statePath := internal.StatePath(clusterName)
+	state, _ := internal.LoadState(statePath)
+	if state.Mode == internal.ModeNamespace {
+		return ""
+	}
 	return "kind-" + clusterName
+}
+
+func resolveAuthMode(clusterName string) string {
+	statePath := internal.StatePath(clusterName)
+	state, _ := internal.LoadState(statePath)
+	if state.AuthMode != "" {
+		return state.AuthMode
+	}
+	ctx := resolveContext(clusterName)
+	if ctx != "" {
+		return internal.GetAuthMode(ctx)
+	}
+	return internal.GetAuthModeFromResource("deployment", "")
+}
+
+func kubectlWithCtx(ctx string, args ...string) []string {
+	if ctx != "" {
+		return append([]string{"--context", ctx}, args...)
+	}
+	return args
 }
 
 // --- add ---
@@ -53,8 +78,8 @@ func newUserAddCmd(clusterName *string) *cobra.Command {
 			if username == "" || password == "" {
 				return fmt.Errorf("--username and --password are required")
 			}
-			ctx := context(*clusterName)
-			mode := internal.GetAuthMode(ctx)
+			ctx := resolveContext(*clusterName)
+			mode := resolveAuthMode(*clusterName)
 
 			if mode == "byoidc" {
 				if err := entraMockAddUser(ctx, username, password, email); err != nil {
@@ -68,13 +93,13 @@ func newUserAddCmd(clusterName *string) *cobra.Command {
 
 			if clusterAdmin {
 				crbName := fmt.Sprintf("picoshift-admin-%s", username)
-				_ = internal.RunQuiet("kubectl", "--context", ctx,
-					"delete", "clusterrolebinding", crbName, "--ignore-not-found")
-				if err := internal.Run("kubectl", "--context", ctx,
+				_ = internal.RunQuiet("kubectl", kubectlWithCtx(ctx,
+					"delete", "clusterrolebinding", crbName, "--ignore-not-found")...)
+				if err := internal.Run("kubectl", kubectlWithCtx(ctx,
 					"create", "clusterrolebinding", crbName,
 					"--clusterrole=cluster-admin",
 					fmt.Sprintf("--user=%s", username),
-				); err != nil {
+				)...); err != nil {
 					return fmt.Errorf("failed to create ClusterRoleBinding: %w", err)
 				}
 				fmt.Printf("  cluster-admin granted to %s\n", username)
@@ -103,8 +128,8 @@ func newUserDeleteCmd(clusterName *string) *cobra.Command {
 			if username == "" {
 				return fmt.Errorf("--username is required")
 			}
-			ctx := context(*clusterName)
-			mode := internal.GetAuthMode(ctx)
+			ctx := resolveContext(*clusterName)
+			mode := resolveAuthMode(*clusterName)
 
 			if mode == "byoidc" {
 				if err := entraMockDeleteUser(ctx, username); err != nil {
@@ -117,12 +142,12 @@ func newUserDeleteCmd(clusterName *string) *cobra.Command {
 			}
 
 			// Clean up K8s objects
-			_ = internal.RunQuiet("kubectl", "--context", ctx,
-				"delete", "user.user.openshift.io", username, "--ignore-not-found")
-			_ = internal.RunQuiet("kubectl", "--context", ctx,
-				"delete", "identity.user.openshift.io", fmt.Sprintf("ocp-sim.%s", username), "--ignore-not-found")
-			_ = internal.RunQuiet("kubectl", "--context", ctx,
-				"delete", "clusterrolebinding", fmt.Sprintf("picoshift-admin-%s", username), "--ignore-not-found")
+			_ = internal.RunQuiet("kubectl", kubectlWithCtx(ctx,
+				"delete", "user.user.openshift.io", username, "--ignore-not-found")...)
+			_ = internal.RunQuiet("kubectl", kubectlWithCtx(ctx,
+				"delete", "identity.user.openshift.io", fmt.Sprintf("ocp-sim.%s", username), "--ignore-not-found")...)
+			_ = internal.RunQuiet("kubectl", kubectlWithCtx(ctx,
+				"delete", "clusterrolebinding", fmt.Sprintf("picoshift-admin-%s", username), "--ignore-not-found")...)
 
 			fmt.Printf("User %q deleted\n", username)
 			return nil
@@ -140,8 +165,8 @@ func newUserListCmd(clusterName *string) *cobra.Command {
 		Use:   "list",
 		Short: "List users",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx := context(*clusterName)
-			mode := internal.GetAuthMode(ctx)
+			ctx := resolveContext(*clusterName)
+			mode := resolveAuthMode(*clusterName)
 
 			if mode == "byoidc" {
 				return entraMockListUsers(ctx)
@@ -157,10 +182,10 @@ func newUserListCmd(clusterName *string) *cobra.Command {
 // ---------------------------------------------------------------------------
 
 func readHtpasswd(ctx string) (string, error) {
-	out, err := internal.RunOutputQuiet("kubectl", "--context", ctx,
+	out, err := internal.RunOutputQuiet("kubectl", kubectlWithCtx(ctx,
 		"-n", internal.HtpasswdNamespace,
 		"get", "secret", internal.HtpasswdSecret,
-		"-o", "jsonpath={.data.htpasswd}")
+		"-o", "jsonpath={.data.htpasswd}")...)
 	if err != nil {
 		return "", nil // secret doesn't exist yet
 	}
@@ -184,14 +209,18 @@ stringData:
 	for _, line := range strings.Split(strings.TrimRight(htpasswd, "\n"), "\n") {
 		secret += "    " + line + "\n"
 	}
+	ctxFlag := ""
+	if ctx != "" {
+		ctxFlag = "--context " + ctx + " "
+	}
 	return internal.Run("bash", "-c",
-		fmt.Sprintf("cat <<'HTPASSWD_EOF' | kubectl --context %s apply -f -\n%sHTPASSWD_EOF", ctx, secret))
+		fmt.Sprintf("cat <<'HTPASSWD_EOF' | kubectl %sapply -f -\n%sHTPASSWD_EOF", ctxFlag, secret))
 }
 
 func htpasswdAddUser(ctx, username, password string) error {
 	// Ensure namespace exists
-	_ = internal.RunQuiet("kubectl", "--context", ctx,
-		"create", "namespace", internal.HtpasswdNamespace)
+	_ = internal.RunQuiet("kubectl", kubectlWithCtx(ctx,
+		"create", "namespace", internal.HtpasswdNamespace)...)
 
 	current, err := readHtpasswd(ctx)
 	if err != nil {
@@ -281,14 +310,14 @@ func htpasswdListUsers(ctx string) error {
 		username := parts[0]
 		admin := "no"
 		crbName := fmt.Sprintf("picoshift-admin-%s", username)
-		if internal.RunQuiet("kubectl", "--context", ctx,
-			"get", "clusterrolebinding", crbName) == nil {
+		if internal.RunQuiet("kubectl", kubectlWithCtx(ctx,
+			"get", "clusterrolebinding", crbName)...) == nil {
 			admin = "yes"
 		}
 		// Also check the ocp-sim-admin binding for the default admin user
 		if username == "admin" && admin == "no" {
-			if internal.RunQuiet("kubectl", "--context", ctx,
-				"get", "clusterrolebinding", "ocp-sim-admin") == nil {
+			if internal.RunQuiet("kubectl", kubectlWithCtx(ctx,
+				"get", "clusterrolebinding", "ocp-sim-admin")...) == nil {
 				admin = "yes"
 			}
 		}
@@ -302,11 +331,11 @@ func htpasswdListUsers(ctx string) error {
 // ---------------------------------------------------------------------------
 
 func entraMockExec(ctx string, curlArgs ...string) (string, error) {
-	args := []string{"--context", ctx,
+	args := kubectlWithCtx(ctx,
 		"-n", internal.EntraMockNamespace,
 		"exec", "deploy/entra-mock", "--",
-		"curl", "-s", "-u", ":" + internal.EntraMockAdminPass,
-	}
+		"curl", "-s", "-u", ":"+internal.EntraMockAdminPass,
+	)
 	args = append(args, curlArgs...)
 	return internal.RunOutputQuiet("kubectl", args...)
 }
@@ -406,13 +435,13 @@ func entraMockListUsers(ctx string) error {
 	for _, u := range users {
 		admin := "no"
 		crbName := fmt.Sprintf("picoshift-admin-%s", u.UPN)
-		if internal.RunQuiet("kubectl", "--context", ctx,
-			"get", "clusterrolebinding", crbName) == nil {
+		if internal.RunQuiet("kubectl", kubectlWithCtx(ctx,
+			"get", "clusterrolebinding", crbName)...) == nil {
 			admin = "yes"
 		}
 		if u.UPN == "admin" && admin == "no" {
-			if internal.RunQuiet("kubectl", "--context", ctx,
-				"get", "clusterrolebinding", "ocp-sim-admin") == nil {
+			if internal.RunQuiet("kubectl", kubectlWithCtx(ctx,
+				"get", "clusterrolebinding", "ocp-sim-admin")...) == nil {
 				admin = "yes"
 			}
 		}
