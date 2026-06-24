@@ -842,12 +842,11 @@ func createNamespaceMode(root, name, authMode string) error {
 		return fmt.Errorf("RBAC pre-flight failed: current user cannot create CRDs. Cluster-admin access is required for namespace mode")
 	}
 
-	// Detect real OCP cluster (abort to prevent overwriting native CRDs)
-	if internal.RunQuiet("kubectl", "get", "crd", "routes.route.openshift.io") == nil {
-		if internal.RunQuiet("kubectl", "get", "crd", "clusteroperators.config.openshift.io") == nil {
-			return fmt.Errorf("this appears to be a real OpenShift cluster (native Route and ClusterOperator CRDs detected). " +
-				"Namespace mode would overwrite native CRDs. Use a vanilla Kubernetes cluster instead")
-		}
+	// Detect real OCP cluster: ClusterOperator CRD is the definitive marker
+	// (ROSA HCP may not have routes.route.openshift.io)
+	isOCP := internal.RunQuiet("kubectl", "get", "crd", "clusteroperators.config.openshift.io") == nil
+	if isOCP {
+		fmt.Println("  Detected OpenShift cluster. Will skip CRDs and use existing cluster config.")
 	}
 
 	// Save state EARLY so partial deploys can be cleaned up
@@ -859,31 +858,38 @@ func createNamespaceMode(root, name, authMode string) error {
 		return fmt.Errorf("failed to save state: %w", err)
 	}
 
-	totalSteps := 6
 	step := 0
+	totalSteps := 2 // simulator + seed namespaces are always deployed
+	if !isOCP {
+		totalSteps = 6
+	}
 
-	step++
-	fmt.Printf("[%d/%d] Deploying CRDs...\n", step, totalSteps)
-	if err := deployCRDs(root); err != nil {
-		return err
+	if !isOCP {
+		step++
+		fmt.Printf("[%d/%d] Deploying CRDs...\n", step, totalSteps)
+		if err := deployCRDs(root); err != nil {
+			return err
+		}
 	}
 
 	step++
 	fmt.Printf("[%d/%d] Deploying seed resources (auth-mode=%s)...\n", step, totalSteps, authMode)
-	if err := deploySeedNamespaceMode(root, authMode); err != nil {
+	if err := deploySeedNamespaceMode(root, authMode, isOCP); err != nil {
 		return err
 	}
 
-	step++
-	fmt.Printf("[%d/%d] Creating ClusterVersion...\n", step, totalSteps)
-	if err := deployClusterVersionNamespaceMode(); err != nil {
-		return err
-	}
+	if !isOCP {
+		step++
+		fmt.Printf("[%d/%d] Creating ClusterVersion...\n", step, totalSteps)
+		if err := deployClusterVersionNamespaceMode(); err != nil {
+			return err
+		}
 
-	step++
-	fmt.Printf("[%d/%d] Patching status subresources...\n", step, totalSteps)
-	if err := patchStatusSubresources(); err != nil {
-		return err
+		step++
+		fmt.Printf("[%d/%d] Patching status subresources...\n", step, totalSteps)
+		if err := patchStatusSubresources(); err != nil {
+			return err
+		}
 	}
 
 	step++
@@ -892,15 +898,22 @@ func createNamespaceMode(root, name, authMode string) error {
 		return err
 	}
 
-	step++
-	fmt.Printf("[%d/%d] Setting up admin RBAC...\n", step, totalSteps)
-	if err := setupAdminRBAC(); err != nil {
-		return err
+	if !isOCP {
+		step++
+		fmt.Printf("[%d/%d] Setting up admin RBAC...\n", step, totalSteps)
+		if err := setupAdminRBAC(); err != nil {
+			return err
+		}
+	} else {
+		fmt.Println("  Skipping admin RBAC (using existing cluster authentication)")
 	}
 
 	fmt.Println("\n=== Ready (namespace mode) ===")
 	fmt.Println("  picoshift status")
 	fmt.Println("  picoshift logs")
+	if isOCP {
+		fmt.Println("  Running on OpenShift (CRDs and cluster config preserved)")
+	}
 	fmt.Println("")
 	fmt.Println("  NOTE: Webhook-based admission (MutatingWebhookConfiguration,")
 	fmt.Println("  ValidatingWebhookConfiguration) may return 403 errors if the")
@@ -908,8 +921,20 @@ func createNamespaceMode(root, name, authMode string) error {
 	return nil
 }
 
-func deploySeedNamespaceMode(root, authMode string) error {
+func deploySeedNamespaceMode(root, authMode string, isOCP bool) error {
 	seedDir := filepath.Join(root, "deploy/seed")
+
+	// On OCP, only create namespaces that don't exist yet (everything else is native)
+	if isOCP {
+		files := []string{"namespaces.yaml"}
+		for _, f := range files {
+			if err := internal.Run("kubectl", "apply", "-f", filepath.Join(seedDir, f)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	files := []string{
 		"namespaces.yaml",
 		"cluster-config.yaml",
@@ -978,12 +1003,20 @@ func deploySimNamespaceMode(root, authMode string) error {
 		return err
 	}
 
-	// Patch image to match CLI version (manifest hardcodes :latest)
-	simImage := internal.ResolvedSimImage()
-	if err := internal.Run("kubectl", "-n", internal.SimNamespace,
-		"set", "image", "deployment/ocp-sim", "ocp-sim="+simImage); err != nil {
-		return err
+	// Patch image to match CLI version (manifest hardcodes ghcr.io :latest)
+	// Skip in dev mode: the manifest's registry image is better than localhost/ocp-sim:latest
+	if !internal.IsDevMode() {
+		simImage := internal.ResolvedSimImage()
+		if err := internal.Run("kubectl", "-n", internal.SimNamespace,
+			"set", "image", "deployment/ocp-sim", "ocp-sim="+simImage); err != nil {
+			return err
+		}
 	}
+
+	// Add securityContext for OCP restricted SCC compliance
+	secCtxPatch := `{"spec":{"template":{"spec":{"securityContext":{"runAsNonRoot":true,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"ocp-sim","securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}}}`
+	_ = internal.RunQuiet("kubectl", "-n", internal.SimNamespace,
+		"patch", "deployment", "ocp-sim", "--type=strategic", "-p", secCtxPatch)
 
 	// Patch auth mode if not legacy
 	if authMode == "oidc" {
