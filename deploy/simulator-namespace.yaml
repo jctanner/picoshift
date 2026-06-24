@@ -1,0 +1,216 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ocp-sim
+  namespace: ocp-sim
+  labels:
+    app.kubernetes.io/managed-by: picoshift-namespace
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ocp-sim-ns
+  labels:
+    app.kubernetes.io/managed-by: picoshift-namespace
+rules:
+  # Route controller: full CRUD on routes, status updates
+  - apiGroups: ["route.openshift.io"]
+    resources: ["routes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["route.openshift.io"]
+    resources: ["routes/status"]
+    verbs: ["get", "update", "patch"]
+
+  # Gateway controller: read-only + status updates
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways", "httproutes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways/status", "httproutes/status"]
+    verbs: ["get", "update", "patch"]
+
+  # Istio destinationrules: read-only
+  - apiGroups: ["networking.istio.io"]
+    resources: ["destinationrules"]
+    verbs: ["get", "list", "watch"]
+
+  # OAuth: read OAuthClients
+  - apiGroups: ["oauth.openshift.io"]
+    resources: ["oauthclients"]
+    verbs: ["get", "list", "watch"]
+
+  # Project controller: namespaces + projects CRUD
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["project.openshift.io"]
+    resources: ["projects"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Webhook configs: READ-ONLY (get, list, watch only, NO create/update/patch)
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"]
+    verbs: ["get", "list", "watch"]
+
+  # Nodes: read-only
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+
+  # JobSet controller: CRUD on jobsets + status
+  - apiGroups: ["jobset.x-k8s.io"]
+    resources: ["jobsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["jobset.x-k8s.io"]
+    resources: ["jobsets/status"]
+    verbs: ["get", "update", "patch"]
+
+  # ImageStream controller: read + update/patch
+  - apiGroups: ["image.openshift.io"]
+    resources: ["imagestreams"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+
+  # User/Identity: read + create/update/patch
+  - apiGroups: ["user.openshift.io"]
+    resources: ["users", "identities"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  # Services: read + create/update/patch + status updates
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services/status"]
+    verbs: ["get", "update", "patch"]
+
+  # Endpoints: read-only
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch"]
+
+  # Deployments: read-only
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+
+  # Pods: read-only (get, list, watch only, NO delete)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
+  # Jobs: full CRUD
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Secrets: cluster-wide get, list, watch, create, update, patch, delete
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ConfigMaps: cluster-wide get, list, watch, create, update, patch
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ocp-sim-ns
+  labels:
+    app.kubernetes.io/managed-by: picoshift-namespace
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ocp-sim-ns
+subjects:
+  - kind: ServiceAccount
+    name: ocp-sim
+    namespace: ocp-sim
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ocp-sim
+  namespace: ocp-sim
+  labels:
+    app: ocp-sim
+    app.kubernetes.io/managed-by: picoshift-namespace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ocp-sim
+  template:
+    metadata:
+      labels:
+        app: ocp-sim
+        app.kubernetes.io/managed-by: picoshift-namespace
+    spec:
+      serviceAccountName: ocp-sim
+      containers:
+        - name: ocp-sim
+          image: ghcr.io/jctanner/picoshift/ocp-sim:latest
+          imagePullPolicy: Always
+          args:
+            - "--proxy"
+            - "--proxy-port"
+            - "80"
+            - "--users-file"
+            - "/etc/ocp-sim/users.yaml"
+          ports:
+            - containerPort: 80
+              name: http
+              protocol: TCP
+            - containerPort: 443
+              name: https
+              protocol: TCP
+            - containerPort: 8443
+              name: webhook
+              protocol: TCP
+            - containerPort: 9443
+              name: oauth
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: "ocp_sim=info,kube=warn"
+            - name: ENABLE_BUILTIN_GATEWAY
+              value: "false"
+          volumeMounts:
+            - name: users-config
+              mountPath: /etc/ocp-sim
+              readOnly: true
+      volumes:
+        - name: users-config
+          configMap:
+            name: ocp-sim-users
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ocp-sim
+  namespace: ocp-sim
+  labels:
+    app: ocp-sim
+    app.kubernetes.io/managed-by: picoshift-namespace
+spec:
+  selector:
+    app: ocp-sim
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP
+    - name: https
+      port: 443
+      targetPort: 443
+      protocol: TCP
+    - name: webhook
+      port: 8443
+      targetPort: 8443
+      protocol: TCP
+    - name: oauth
+      port: 9443
+      targetPort: 9443
+      protocol: TCP

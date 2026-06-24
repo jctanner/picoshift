@@ -29,8 +29,9 @@ const (
 	EntraMockImage = "localhost/entra-mock:latest"
 
 	KindConfig  = "deploy/kind/cluster.yaml"
-	SimManifest = "deploy/simulator.yaml"
-	UsersFile   = "deploy/users.yaml"
+	SimManifest          = "deploy/simulator.yaml"
+	SimNamespaceManifest = "deploy/simulator-namespace.yaml"
+	UsersFile            = "deploy/users.yaml"
 
 	SimNamespace       = "ocp-sim"
 	OperatorNamespace  = "opendatahub-operator-system"
@@ -50,7 +51,13 @@ const (
 
 	OLMDefaultVersion = "v0.42.0"
 	OLMNamespace      = "olm"
+
+	ModeKind      = "kind"
+	ModeNamespace = "namespace"
+	DefaultMode   = ModeKind
 )
+
+var CRDDirs = []string{"openshift", "olm", "gateway", "monitoring", "istio", "authorino", "kuadrant"}
 
 func IsDevMode() bool {
 	return Version == "" || Version == "dev"

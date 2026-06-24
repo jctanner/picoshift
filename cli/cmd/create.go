@@ -13,6 +13,7 @@ import (
 func NewCreateCmd(version string) *cobra.Command {
 	var (
 		name       string
+		mode       string
 		authMode   string
 		noDeploy   bool
 		build      bool
@@ -28,16 +29,52 @@ func NewCreateCmd(version string) *cobra.Command {
 
 Creates the cluster, installs CRDs and seed resources, and deploys the
 simulator using existing images. Use --build to build images first, or
-run 'picoshift build' separately.`,
+run 'picoshift build' separately.
+
+Use --mode=namespace to deploy into an existing Kubernetes cluster instead
+of creating a kind cluster. This mode deploys CRDs, seed resources, and
+the simulator as a Deployment (not DaemonSet) in the target cluster.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			root, err := internal.ProjectRoot()
 			if err != nil {
 				return err
 			}
 
+			if err := internal.ValidateName(name); err != nil {
+				return err
+			}
+
 			if authMode != "legacy" && authMode != "oidc" && authMode != "byoidc" {
 				return fmt.Errorf("invalid --auth-mode %q: must be legacy, oidc, or byoidc", authMode)
 			}
+
+			// Mode validation
+			if mode != internal.ModeKind && mode != internal.ModeNamespace {
+				return fmt.Errorf("invalid --mode %q: must be %s or %s", mode, internal.ModeKind, internal.ModeNamespace)
+			}
+			if mode == internal.ModeNamespace {
+				// Flag conflict guards: these flags are kind-mode only
+				if build {
+					return fmt.Errorf("--build is not supported in namespace mode")
+				}
+				if noDeploy {
+					return fmt.Errorf("--no-deploy is not supported in namespace mode")
+				}
+				if withOLM {
+					return fmt.Errorf("--with-olm is not supported in namespace mode")
+				}
+				if withOSSM3 {
+					return fmt.Errorf("--with-ossm3 is not supported in namespace mode")
+				}
+				if pullSecret != "" {
+					return fmt.Errorf("--pull-secret is not supported in namespace mode")
+				}
+				if authMode == "byoidc" {
+					return fmt.Errorf("--auth-mode=byoidc is not supported in namespace mode")
+				}
+				return createNamespaceMode(root, name, authMode)
+			}
+
 			if build && !internal.IsDevMode() {
 				fmt.Printf("picoshift %s uses pre-built images from %s — ignoring --build.\n",
 					internal.Version, internal.DefaultRegistry)
@@ -254,6 +291,16 @@ run 'picoshift build' separately.`,
 				}
 			}
 
+			// Save state so delete/status commands know the mode
+			statePath := internal.StatePath(name)
+			if err := internal.SaveState(&internal.PicoshiftState{
+				Mode:     internal.ModeKind,
+				Name:     name,
+				AuthMode: authMode,
+			}, statePath); err != nil {
+				fmt.Printf("  warning: failed to save state: %v\n", err)
+			}
+
 			fmt.Println("\n=== Ready ===")
 			fmt.Println("  picoshift status")
 			fmt.Println("  picoshift logs")
@@ -263,6 +310,7 @@ run 'picoshift build' separately.`,
 	}
 
 	cmd.Flags().StringVar(&name, "name", internal.DefaultClusterName, "Cluster name")
+	cmd.Flags().StringVar(&mode, "mode", internal.DefaultMode, "Deployment mode: kind (full cluster) or namespace (deploy into existing cluster)")
 	cmd.Flags().StringVar(&authMode, "auth-mode", internal.DefaultAuthMode, "Auth mode: legacy, oidc, or byoidc")
 	cmd.Flags().BoolVar(&noDeploy, "no-deploy", false, "Create cluster only, skip CRDs/seed/simulator")
 	cmd.Flags().BoolVar(&build, "build", false, "Build all images before creating the cluster")
@@ -292,8 +340,7 @@ func checkDeps(root string) error {
 
 func deployCRDs(root string) error {
 	crdsDir := filepath.Join(root, "deploy/crds")
-	dirs := []string{"openshift", "olm", "gateway", "monitoring", "istio", "authorino", "kuadrant"}
-	for _, d := range dirs {
+	for _, d := range internal.CRDDirs {
 		if d == "olm" && isOLMInstalled() {
 			fmt.Println("  OLM is running — skipping stub OLM CRDs")
 			continue
@@ -758,4 +805,282 @@ func waitForIstiod(timeout time.Duration) error {
 		time.Sleep(10 * time.Second)
 	}
 	return fmt.Errorf("istiod did not become healthy after %v", timeout)
+}
+
+// --- namespace-mode functions ---
+
+func createNamespaceMode(root, name, authMode string) error {
+	// Only kubectl is needed in namespace mode
+	if err := internal.CheckDep("kubectl"); err != nil {
+		return err
+	}
+
+	// Idempotency guard: check state file + deployment existence
+	statePath := internal.StatePath(name)
+	existing, _ := internal.LoadState(statePath)
+	if existing.Mode == internal.ModeNamespace {
+		if err := internal.RunQuiet("kubectl", "get", "deployment", "ocp-sim", "-n", internal.SimNamespace); err == nil {
+			fmt.Println("picoshift namespace-mode deployment already exists. Delete first with 'picoshift delete'.")
+			return nil
+		}
+	}
+
+	// Verify kubeconfig connectivity
+	if err := internal.RunQuiet("kubectl", "cluster-info"); err != nil {
+		return fmt.Errorf("cannot reach cluster. Check your kubeconfig: %w", err)
+	}
+
+	// Log the active context
+	ctx, err := internal.RunOutputQuiet("kubectl", "config", "current-context")
+	if err != nil {
+		return fmt.Errorf("failed to get current kubectl context: %w", err)
+	}
+	fmt.Printf("Deploying picoshift in namespace mode (context: %s)\n", ctx)
+
+	// Pre-flight RBAC check: can the current user create CRDs?
+	if err := internal.RunQuiet("kubectl", "auth", "can-i", "create", "customresourcedefinitions"); err != nil {
+		return fmt.Errorf("RBAC pre-flight failed: current user cannot create CRDs. Cluster-admin access is required for namespace mode")
+	}
+
+	// Detect real OCP cluster: ClusterOperator CRD is the definitive marker
+	// (ROSA HCP may not have routes.route.openshift.io)
+	isOCP := internal.RunQuiet("kubectl", "get", "crd", "clusteroperators.config.openshift.io") == nil
+	if isOCP {
+		fmt.Println("  Detected OpenShift cluster. Will skip CRDs and use existing cluster config.")
+	}
+
+	// Save state EARLY so partial deploys can be cleaned up
+	if err := internal.SaveState(&internal.PicoshiftState{
+		Mode:     internal.ModeNamespace,
+		Name:     name,
+		AuthMode: authMode,
+	}, statePath); err != nil {
+		return fmt.Errorf("failed to save state: %w", err)
+	}
+
+	step := 0
+	totalSteps := 2 // simulator + seed namespaces are always deployed
+	if !isOCP {
+		totalSteps = 6
+	}
+
+	if !isOCP {
+		step++
+		fmt.Printf("[%d/%d] Deploying CRDs...\n", step, totalSteps)
+		if err := deployCRDs(root); err != nil {
+			return err
+		}
+	}
+
+	step++
+	fmt.Printf("[%d/%d] Deploying seed resources (auth-mode=%s)...\n", step, totalSteps, authMode)
+	if err := deploySeedNamespaceMode(root, authMode, isOCP); err != nil {
+		return err
+	}
+
+	if !isOCP {
+		step++
+		fmt.Printf("[%d/%d] Creating ClusterVersion...\n", step, totalSteps)
+		if err := deployClusterVersionNamespaceMode(); err != nil {
+			return err
+		}
+
+		step++
+		fmt.Printf("[%d/%d] Patching status subresources...\n", step, totalSteps)
+		if err := patchStatusSubresources(); err != nil {
+			return err
+		}
+	}
+
+	step++
+	fmt.Printf("[%d/%d] Deploying simulator...\n", step, totalSteps)
+	if err := deploySimNamespaceMode(root, authMode); err != nil {
+		return err
+	}
+
+	if !isOCP {
+		step++
+		fmt.Printf("[%d/%d] Setting up admin RBAC...\n", step, totalSteps)
+		if err := setupAdminRBAC(); err != nil {
+			return err
+		}
+	} else {
+		fmt.Println("  Skipping admin RBAC (using existing cluster authentication)")
+	}
+
+	fmt.Println("\n=== Ready (namespace mode) ===")
+	fmt.Println("  picoshift status")
+	fmt.Println("  picoshift logs")
+	if isOCP {
+		fmt.Println("  Running on OpenShift (CRDs and cluster config preserved)")
+	}
+	fmt.Println("")
+	fmt.Println("  NOTE: Webhook-based admission (MutatingWebhookConfiguration,")
+	fmt.Println("  ValidatingWebhookConfiguration) may return 403 errors if the")
+	fmt.Println("  cluster cannot reach the ocp-sim webhook endpoint.")
+	return nil
+}
+
+func deploySeedNamespaceMode(root, authMode string, isOCP bool) error {
+	seedDir := filepath.Join(root, "deploy/seed")
+
+	// On OCP, only create namespaces that don't exist yet (everything else is native)
+	if isOCP {
+		files := []string{"namespaces.yaml"}
+		for _, f := range files {
+			if err := internal.Run("kubectl", "apply", "-f", filepath.Join(seedDir, f)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	files := []string{
+		"namespaces.yaml",
+		"cluster-config.yaml",
+		"authentication.yaml",
+	}
+	if authMode != "byoidc" {
+		files = append(files, "htpasswd.yaml")
+	}
+	if authMode != "legacy" {
+		files = append(files, "authentication-oidc.yaml")
+	}
+	files = append(files,
+		"ingress.yaml",
+		"infrastructure.yaml",
+		"sccs.yaml",
+		"jobset-operator.yaml",
+		"rbac-compat.yaml",
+	)
+	for _, f := range files {
+		if err := internal.Run("kubectl", "apply", "-f", filepath.Join(seedDir, f)); err != nil {
+			return err
+		}
+	}
+	// No endpoints patch in namespace mode (we don't control the API server)
+	return nil
+}
+
+func deployClusterVersionNamespaceMode() error {
+	// Apply ClusterVersion spec using a YAML heredoc
+	cvYAML := `apiVersion: config.openshift.io/v1
+kind: ClusterVersion
+metadata:
+  name: version
+spec:
+  clusterID: ocp-sim-00000000-0000-0000-0000-000000000000
+  channel: stable-4.20`
+
+	if err := internal.Run("bash", "-c", fmt.Sprintf("cat <<'CV_EOF' | kubectl apply -f -\n%s\nCV_EOF", cvYAML)); err != nil {
+		return err
+	}
+
+	// Patch status using kubectl replace --raw (no proxy, no python3, no curl).
+	// Must fetch resourceVersion first: K8s requires it for PUT on status subresources.
+	script := `
+RV=$(kubectl get clusterversion version -o jsonpath='{.metadata.resourceVersion}')
+STATUS="{\"apiVersion\":\"config.openshift.io/v1\",\"kind\":\"ClusterVersion\",\"metadata\":{\"name\":\"version\",\"resourceVersion\":\"${RV}\"},\"spec\":{\"clusterID\":\"ocp-sim-00000000-0000-0000-0000-000000000000\",\"channel\":\"stable-4.20\"},\"status\":{\"desired\":{\"version\":\"4.20.0\"},\"history\":[{\"state\":\"Completed\",\"version\":\"4.20.0\",\"startedTime\":\"2024-01-01T00:00:00Z\",\"completionTime\":\"2024-01-01T01:00:00Z\",\"verified\":true}],\"conditions\":[{\"type\":\"Available\",\"status\":\"True\",\"lastTransitionTime\":\"2024-01-01T01:00:00Z\",\"reason\":\"ClusterVersionAvailable\",\"message\":\"Simulated OCP cluster\"},{\"type\":\"Progressing\",\"status\":\"False\",\"lastTransitionTime\":\"2024-01-01T01:00:00Z\",\"reason\":\"ClusterVersionNotProgressing\"},{\"type\":\"Failing\",\"status\":\"False\",\"lastTransitionTime\":\"2024-01-01T01:00:00Z\",\"reason\":\"ClusterVersionNotFailing\"}]}}"
+kubectl replace --raw /apis/config.openshift.io/v1/clusterversions/version/status -f - <<< "$STATUS" > /dev/null
+`
+	return internal.Run("bash", "-c", script)
+}
+
+func deploySimNamespaceMode(root, authMode string) error {
+	// Create namespace (ignore if exists)
+	_ = internal.Run("kubectl", "create", "namespace", internal.SimNamespace)
+
+	// Create users configmap
+	if err := internal.Run("bash", "-c", fmt.Sprintf(
+		"kubectl -n %s create configmap ocp-sim-users --from-file=%s --dry-run=client -o yaml | kubectl apply -f -",
+		internal.SimNamespace, filepath.Join(root, internal.UsersFile),
+	)); err != nil {
+		return err
+	}
+
+	// Apply namespace-mode simulator manifest (Deployment, not DaemonSet)
+	if err := internal.Run("kubectl", "apply", "-f", filepath.Join(root, internal.SimNamespaceManifest)); err != nil {
+		return err
+	}
+
+	// Patch image to match CLI version (manifest hardcodes ghcr.io :latest)
+	// Skip in dev mode: the manifest's registry image is better than localhost/ocp-sim:latest
+	if !internal.IsDevMode() {
+		simImage := internal.ResolvedSimImage()
+		if err := internal.Run("kubectl", "-n", internal.SimNamespace,
+			"set", "image", "deployment/ocp-sim", "ocp-sim="+simImage); err != nil {
+			return err
+		}
+	}
+
+	// Add securityContext for OCP restricted SCC compliance
+	secCtxPatch := `{"spec":{"template":{"spec":{"securityContext":{"runAsNonRoot":true,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"ocp-sim","securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}}}`
+	_ = internal.RunQuiet("kubectl", "-n", internal.SimNamespace,
+		"patch", "deployment", "ocp-sim", "--type=strategic", "-p", secCtxPatch)
+
+	// Patch auth mode if not legacy
+	if authMode == "oidc" {
+		args := `["--proxy","--proxy-port","80","--users-file","/etc/ocp-sim/users.yaml","--auth-mode","oidc"]`
+		if err := internal.Run("kubectl", "-n", internal.SimNamespace,
+			"patch", "deployment", "ocp-sim", "--type=json",
+			fmt.Sprintf(`-p=[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":%s}]`, args),
+		); err != nil {
+			return err
+		}
+	}
+
+	// Wait for rollout
+	return internal.Run("kubectl", "-n", internal.SimNamespace,
+		"rollout", "status", "deployment/ocp-sim", "--timeout=120s")
+}
+
+func setupAdminRBAC() error {
+	rbacYAML := `apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ocp-sim-admin
+  labels:
+    app.kubernetes.io/managed-by: picoshift-namespace
+subjects:
+- kind: User
+  name: admin
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io`
+
+	return internal.Run("bash", "-c", fmt.Sprintf("cat <<'RBAC_EOF' | kubectl apply -f -\n%s\nRBAC_EOF", rbacYAML))
+}
+
+func patchStatusSubresources() error {
+	// Determine apiServerURL from current kubeconfig
+	apiServerURL, err := internal.RunOutputQuiet("kubectl", "config", "view",
+		"--minify", "-o", "jsonpath={.clusters[0].cluster.server}")
+	if err != nil {
+		return fmt.Errorf("failed to determine API server URL: %w", err)
+	}
+
+	// Patch Infrastructure status using --subresource=status
+	infraPatch := fmt.Sprintf(
+		`{"status":{"controlPlaneTopology":"SingleReplica","infrastructureTopology":"SingleReplica","platform":"None","apiServerURL":"%s"}}`,
+		apiServerURL,
+	)
+	if err := internal.Run("kubectl", "patch", "infrastructure", "cluster",
+		"--type=merge", "--subresource=status",
+		"-p", infraPatch,
+	); err != nil {
+		return fmt.Errorf("failed to patch Infrastructure status: %w", err)
+	}
+
+	// Patch Ingress status using --subresource=status
+	ingressPatch := `{"status":{"defaultPlacement":"Workers"}}`
+	if err := internal.Run("kubectl", "patch", "ingress.config.openshift.io", "cluster",
+		"--type=merge", "--subresource=status",
+		"-p", ingressPatch,
+	); err != nil {
+		return fmt.Errorf("failed to patch Ingress status: %w", err)
+	}
+
+	return nil
 }

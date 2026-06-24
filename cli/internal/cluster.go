@@ -69,6 +69,10 @@ func GetAuthMode(context string) string {
 	if err != nil {
 		return "unknown"
 	}
+	return parseAuthMode(out)
+}
+
+func parseAuthMode(out string) string {
 	if !strings.Contains(out, "--auth-mode") {
 		return "legacy"
 	}
@@ -126,4 +130,19 @@ func runBash(script string) error {
 
 func NamespaceExists(ns, context string) bool {
 	return RunQuiet("kubectl", "--context", context, "get", "namespace", ns) == nil
+}
+
+// GetAuthModeFromResource detects auth mode without requiring a --context flag.
+// resourceKind is the workload kind ("deployment" or "daemonset"), context is optional.
+func GetAuthModeFromResource(resourceKind, context string) string {
+	args := []string{"-n", SimNamespace, "get", resourceKind, "ocp-sim",
+		"-o", "jsonpath={.spec.template.spec.containers[0].args}"}
+	if context != "" {
+		args = append([]string{"--context", context}, args...)
+	}
+	out, err := RunOutputQuiet("kubectl", args...)
+	if err != nil {
+		return "unknown"
+	}
+	return parseAuthMode(out)
 }
